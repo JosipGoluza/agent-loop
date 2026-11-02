@@ -21,6 +21,7 @@ export type Snapshot = {
   startedMs: number
   updatedMs: number
   tools: string
+  note: string // a warning for the header, such as a Workflow run without its transcript link
   phases: PhaseCount[]
   tickets: TicketRow[]
   log: string[]

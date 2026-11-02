@@ -12,14 +12,13 @@ import type { PhaseCount, Snapshot, TicketRow } from '../types'
 //   doing now, at no token cost.
 
 const PANE = 'agent-loop'
-const POLL_MS = 3000
-const TAIL_BYTES = 60000 // enough for the last few tool calls; $.fs.read refuses files over 4 MiB
+const POLL_MS = 5000
 const STALLED_MS = 15 * 60 * 1000 // no write for this long, and not finished: probably stopped
 const BAND_AFTER_MS = 30 * 60 * 1000 // the band shows a finished run this long, then makes way
 const PHASES = ['Plan', 'Build', 'Review', 'Handoff'] as const
 
 // Change the tag when Snapshot changes shape: it declines what an earlier version stored.
-const snapshot = atom({ plugin: 'agent-loop-panel', key: 'snapshot' } as const, null, { shape: 'snapshot-2' })
+const snapshot = atom({ plugin: 'agent-loop-panel', key: 'snapshot' } as const, null, { shape: 'snapshot-3' })
 
 let stateDir: string | null | undefined // undefined: not looked up yet; null: no agent-loop project here
 
@@ -52,15 +51,22 @@ function describe(tool: string, input: Record<string, unknown>): string {
   return tool
 }
 
-// The last tool call in a transcript's tail, or done once the agent returned its result.
-function lastAction(tail: string): { isDone: boolean; action: string } {
-  const lines = tail.split('\n').slice(1) // the first line may be cut
+// The last tool call among a transcript's last assistant entries, or done once the agent
+// returned its result. A line too long for the process output comes back cut: then the
+// tool's name and target are read with a pattern instead.
+function lastAction(text: string): { isDone: boolean; action: string } {
+  const lines = text.split('\n').filter(Boolean)
   for (let i = lines.length - 1; i >= 0; i--) {
     let entry: { type?: string; message?: { content?: { type?: string; name?: string; input?: Record<string, unknown> }[] } }
     try {
       entry = JSON.parse(lines[i] ?? '')
     } catch {
-      continue
+      const names = [...(lines[i] ?? '').matchAll(/"type":"tool_use","id":"[^"]*","name":"(\w+)"/g)]
+      const name = names[names.length - 1]?.[1]
+      if (!name) continue
+      if (name === 'StructuredOutput') return { isDone: true, action: 'done' }
+      const path = /"file_path":"([^"]+)"/.exec(lines[i] ?? '')?.[1]
+      return { isDone: false, action: path ? `${name} ${base(path)}` : name }
     }
     if (entry.type !== 'assistant') continue
     const uses = (entry.message?.content ?? []).filter(c => c.type === 'tool_use')
@@ -92,9 +98,11 @@ async function workflowAgents($: EngineInterface, dir: string): Promise<Agent[]>
       out.push(known)
       continue
     }
-    const tail = await $.process.run(['tail', '-c', String(TAIL_BYTES), `${dir}/${entry.name}`])
+    // The last assistant entries, not the file's last bytes: tool results and request records
+    // after them can be 100 KB each, and $.fs.read refuses files over 4 MiB.
+    const last = await $.process.run(['sh', '-c', 'grep -F "$1" "$2" | tail -n 3', 'sh', '"type":"assistant"', `${dir}/${entry.name}`])
     const ref = /:([^·\s]+)/.exec(meta.label)?.[1] ?? ''
-    const agent = { ...meta, ref, mtimeMs: entry.mtimeMs, ...lastAction(tail.exitCode === 0 ? tail.stdout : '') }
+    const agent = { ...meta, ref, mtimeMs: entry.mtimeMs, ...lastAction(last.exitCode === 0 ? last.stdout : '') }
     agents.set(name, agent)
     out.push(agent)
   }
@@ -189,6 +197,7 @@ async function load($: EngineInterface): Promise<Snapshot | null> {
 
   // A Workflow run: what its agents are doing, from their transcripts.
   let activityMs = newest.mtimeMs
+  const isUnlinked = run.engine === 'workflow' && !run.workflow?.transcripts
   if (run.engine === 'workflow' && run.workflow?.transcripts) {
     const all = await workflowAgents($, run.workflow.transcripts)
     activityMs = Math.max(activityMs, ...all.map(a => a.mtimeMs))
@@ -232,7 +241,8 @@ async function load($: EngineInterface): Promise<Snapshot | null> {
 
   return {
     runId: run.id ?? newest.name,
-    state: run.finished ? 'finished' : now - activityMs > STALLED_MS ? 'stalled' : 'running',
+    state: run.finished ? 'finished' : !isUnlinked && now - activityMs > STALLED_MS ? 'stalled' : 'running',
+    note: isUnlinked && !run.finished ? 'no transcript link: run `agentloop.py wf attach`' : '',
     startedMs: started,
     updatedMs: run.finished ? Date.parse(run.finished) || newest.mtimeMs : now,
     tools,
@@ -305,6 +315,7 @@ export const register: Register = on => {
         <Text wrap="truncate-end">
           <Text bold>agent-loop</Text>
           <Text color={stateColor[s.state]}> {stateLabel[s.state]}</Text>
+          {s.note && <Text color="warning"> · {s.note}</Text>}
           <Text dimColor> · {await elapsed($, s)} · {phases} · /agent-loop-panel for more</Text>
         </Text>
         {shown.map(t => (
@@ -332,6 +343,7 @@ export const register: Register = on => {
         <Text>
           <Text bold>run {s.runId}</Text>
           <Text color={stateColor[s.state]}> · {stateLabel[s.state]}</Text>
+          {s.note && <Text color="warning"> · {s.note}</Text>}
           <Text dimColor> · {took}{s.tools ? ` · ${s.tools}` : ''}</Text>
         </Text>
         <Box flexDirection="row" marginTop={1}>

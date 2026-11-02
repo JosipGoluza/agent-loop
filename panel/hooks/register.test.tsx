@@ -146,14 +146,19 @@ const TRANSCRIPTS: Record<string, { label: string; phase: string; mtimeMs: numbe
   'agent-a2': { label: 'build:#824', phase: 'Build', mtimeMs: NOW - 20000,
     tail: 'cut\n' + line([{ type: 'tool_use', name: 'Bash', input: { command: 'cd /w/824 && make check' } }]) + '\n' +
       line([{ type: 'text', text: 'Now the endpoint.' }, { type: 'tool_use', name: 'Edit', input: { file_path: '/w/824/app/runs.py' } }]) },
-  'agent-a3': { label: 'spec:#825', phase: 'Review', mtimeMs: NOW - 5000, tail: 'cut\n' },
+  'agent-a3': { label: 'spec:#825', phase: 'Review', mtimeMs: NOW - 5000, tail: '' },
+  // a Write with a huge body: the process output cuts the line, so it is not valid JSON
+  'agent-a4': { label: 'build:#826', phase: 'Build', mtimeMs: NOW - 3000,
+    tail: '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_9","name":"Write","input":{"file_path":"/w/826/app/big.py","content":"x = 1\\n' },
 }
+
+let unlinked = false
 
 function workflowProject(on: any) {
   on('session.root', () => ({ value: '/repo' }))
   on('process.run', (_: unknown, e: any) => {
     const argv: string[] = e.argv
-    if (argv[0] === 'tail') {
+    if (argv[0] === 'sh') {
       const name = /(agent-[^/.]+)\.jsonl$/.exec(argv[argv.length - 1] ?? '')?.[1] ?? ''
       return { value: { exitCode: 0, stdout: TRANSCRIPTS[name]?.tail ?? '', stderr: '' } }
     }
@@ -180,9 +185,10 @@ function workflowProject(on: any) {
     if (e.path === `${WF_RUN}/run.json`) {
       return { value: JSON.stringify({
         id: '20261102-090000', started: '2026-10-27T11:30:00', finished: null, engine: 'workflow',
-        workflow: { id: 'wf_1', transcripts: WF },
-        prepared: [{ id: '824', ref: '#824', worktree: '/w/824' }, { id: '825', ref: '#825', worktree: '/w/825' }],
-        tickets: { '824': { ref: '#824', name: 'Show runs', stage: 'queued' }, '825': { ref: '#825', name: 'Filter runs', stage: 'queued' } },
+        workflow: unlinked ? undefined : { id: 'wf_1', transcripts: WF },
+        prepared: [{ id: '824', ref: '#824', worktree: '/w/824' }, { id: '825', ref: '#825', worktree: '/w/825' }, { id: '826', ref: '#826', worktree: '/w/826' }],
+        tickets: { '824': { ref: '#824', name: 'Show runs', stage: 'queued' }, '825': { ref: '#825', name: 'Filter runs', stage: 'queued' },
+          '826': { ref: '#826', name: 'Big file', stage: 'queued' } },
       }) }
     }
     const meta = /(agent-[^/.]+)\.meta\.json$/.exec(e.path)?.[1]
@@ -200,8 +206,24 @@ test('a Workflow run shows what each agent does now, from its transcript', async
   const band = await $.ui.mount({ ...BAND(8), surface: 'terminal' })
 
   // a 10-minute build with a fresh transcript write is running, not "stalled"
-  expect((await band.find({ type: 'Text', text: /agent-loop/ }))?.text).toMatch(/running · 10m00s · Plan 2\/2  Build 1\/2  Review 0\/2/)
+  expect((await band.find({ type: 'Text', text: /agent-loop/ }))?.text).toMatch(/running · 10m00s · Plan 3\/3  Build 1\/3  Review 0\/3/)
   expect((await band.find({ type: 'Text', text: /#824/ }))?.text).toMatch(/#824 Show runs · build · Edit runs\.py · 20s ago · 3 files \+120 −4, 1 new/)
   expect((await band.find({ type: 'Text', text: /#825/ }))?.text).toMatch(/#825 Filter runs · spec · starting · 5s ago/)
+  expect((await band.find({ type: 'Text', text: /#826/ }))?.text).toMatch(/#826 Big file · build · Write big\.py · 3s ago/)
   await band.unmount()
+})
+
+test('a Workflow run without its transcript link says so instead of looking stalled', async ($, on) => {
+  unlinked = true
+  try {
+    workflowProject(on)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    const band = await $.ui.mount({ ...BAND(8), surface: 'terminal' })
+    const header = (await band.find({ type: 'Text', text: /agent-loop/ }))?.text
+    expect(header).toMatch(/running · no transcript link: run `agentloop.py wf attach`/)
+    expect(header).not.toMatch(/stopped/)
+    await band.unmount()
+  } finally {
+    unlinked = false
+  }
 })
