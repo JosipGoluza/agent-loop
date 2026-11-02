@@ -1208,6 +1208,7 @@ def cmd_wf(a) -> None:
     start     prepare the tickets and the run folder; print the workflow's arguments
     checks    run the checks in a worktree; report the risky paths and the staged tree
     handoff   write a ticket's handoff note from <run dir>/<id>.handoff.json
+    attach    record the Workflow's id and transcript folder, so the panel can show live progress
     finish    record the workflow's summary (<run dir>/summary.json) in run.json
     """
     import runner
@@ -1269,7 +1270,12 @@ def cmd_wf(a) -> None:
 
     run_dir = runs_dir(p) / a.target
     run = runner.Run.load(run_dir)
-    if a.action == "handoff":
+    if a.action == "attach":
+        if not a.transcripts or not Path(a.transcripts).is_dir():
+            raise SystemExit(f"No transcript folder at {a.transcripts}")
+        run.update(workflow={"id": a.wf or "", "transcripts": str(Path(a.transcripts).resolve())})
+        print(f"run {run.id} attached to workflow {a.wf or '?'}")
+    elif a.action == "handoff":
         data = json.loads((run_dir / f"{a.id}.handoff.json").read_text())
         t = next(x for x in run.tickets if x["id"] == a.id)
         res = {"status": data.get("status", "needs-human"), "why": data.get("why", ""), "preExisting": data.get("preExisting") or []}
@@ -1452,10 +1458,11 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--force", action="store_true"); x.add_argument("--resume"); x.add_argument("--detach", action="store_true")
     x.add_argument("--build", action="store_true", help="with --resume: carry a --plan run on into implementation"); x.set_defaults(fn=cmd_run)
     x = sub.add_parser("wf", help="steps of a Claude Code Workflow run")
-    x.add_argument("action", choices=["start", "checks", "handoff", "finish"])
+    x.add_argument("action", choices=["start", "checks", "attach", "handoff", "finish"])
     x.add_argument("target", nargs="?", help="checks: the worktree; handoff/finish: the run id")
     x.add_argument("ids", nargs="*"); x.add_argument("--plan", action="store_true"); x.add_argument("--force", action="store_true")
     x.add_argument("--id"); x.add_argument("--run"); x.add_argument("--round", type=int); x.add_argument("--base"); x.add_argument("--files")
+    x.add_argument("--wf", help="attach: the Workflow run id"); x.add_argument("--transcripts", help="attach: the Workflow transcript folder")
     x.set_defaults(fn=cmd_wf)
     x = sub.add_parser("status"); x.add_argument("run", nargs="?"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_status)
     x = sub.add_parser("handoffs"); x.add_argument("--status"); x.set_defaults(fn=cmd_handoffs)

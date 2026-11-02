@@ -53,8 +53,13 @@ In Claude Code, the `sprint` and `ticket` skills run the loop as a Claude Code W
 Code shows its own progress view (`/workflows`): the phases, each agent with its model, tokens
 and time, the arrow keys to look inside, and the keys to stop or pause.
 
-The optional `agent-loop-panel` shows runs that the Python runner does (`agentloop.py run`, for
-example from a terminal) in a band above the prompt. `/agent-loop-panel` opens its full pane.
+The workflow also writes a line to that view at each stage boundary, for example
+`#824: checks 1 passing`, `#824: review · 1 blocking, 2 minor`, `#824: ready to ship`.
+
+The optional `agent-loop-panel` adds a band above the prompt with what each ticket does now. For a
+Workflow run it reads the transcripts that Claude Code keeps for each agent, so it costs no tokens:
+the running agents, the last tool call (for example `Edit runs.py · 20s ago`) and the size of the
+change so far. It shows runs of the Python runner too. `/agent-loop-panel` opens its full pane.
 
 ### Codex
 

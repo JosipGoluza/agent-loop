@@ -3,19 +3,23 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { PhaseCount, Snapshot, TicketRow } from '../types'
 
-// A live view of the newest agent-loop run in this project. The runner writes
-// <state>/runs/<id>/run.json, one <ticket>.<label>.prompt.md per agent call it
-// starts and <ticket>.<label>.json when that call finishes, and log.txt.
-// This module only reads those files.
+// A live view of the newest agent-loop run in this project. It only reads files:
+// - the Python runner writes <state>/runs/<id>/run.json, one <ticket>.<label>.prompt.md
+//   per agent call it starts, <ticket>.<label>.json when that call finishes, and log.txt;
+// - a Claude Code Workflow run has run.json too, and `wf attach` records the folder where
+//   Claude Code keeps each agent's transcript (agent-<id>.jsonl, and agent-<id>.meta.json
+//   with its label and phase). The last tool call in a transcript says what the agent is
+//   doing now, at no token cost.
 
 const PANE = 'agent-loop'
-const POLL_MS = 2000
+const POLL_MS = 3000
+const TAIL_BYTES = 60000 // enough for the last few tool calls; $.fs.read refuses files over 4 MiB
 const STALLED_MS = 15 * 60 * 1000 // no write for this long, and not finished: probably stopped
 const BAND_AFTER_MS = 30 * 60 * 1000 // the band shows a finished run this long, then makes way
 const PHASES = ['Plan', 'Build', 'Review', 'Handoff'] as const
 
 // Change the tag when Snapshot changes shape: it declines what an earlier version stored.
-const snapshot = atom({ plugin: 'agent-loop-panel', key: 'snapshot' } as const, null, { shape: 'snapshot-1' })
+const snapshot = atom({ plugin: 'agent-loop-panel', key: 'snapshot' } as const, null, { shape: 'snapshot-2' })
 
 let stateDir: string | null | undefined // undefined: not looked up yet; null: no agent-loop project here
 
@@ -25,9 +29,90 @@ type Run = {
   created?: string
   finished?: string | null
   agents?: Record<string, string | null>
-  prepared?: { id: string }[]
+  prepared?: { id: string; ref?: string; worktree?: string }[]
+  engine?: string
+  workflow?: { id?: string; transcripts?: string }
   tickets?: Record<string, { ref?: string; name?: string; stage?: string; status?: string; rounds?: number; risk?: string; why?: string }>
 }
+
+type Agent = { label: string; phase: string; ref: string; mtimeMs: number; isDone: boolean; action: string }
+const metas = new Map<string, { label: string; phase: string }>() // agent file name -> label and phase; they never change
+const agents = new Map<string, Agent>() // agent file name -> what its transcript said at mtimeMs
+
+const base = (path: string) => path.split('/').pop() ?? path
+
+function describe(tool: string, input: Record<string, unknown>): string {
+  const text = (v: unknown) => (typeof v === 'string' ? v : '')
+  if (text(input.file_path)) return `${tool} ${base(text(input.file_path))}`
+  if (tool === 'Bash') {
+    const cmd = text(input.command).replace(/^cd \S+ && /, '').split('\n')[0] ?? ''
+    return `$ ${cmd.length > 48 ? cmd.slice(0, 47) + '…' : cmd}`
+  }
+  if (text(input.pattern)) return `${tool} ${text(input.pattern)}`
+  return tool
+}
+
+// The last tool call in a transcript's tail, or done once the agent returned its result.
+function lastAction(tail: string): { isDone: boolean; action: string } {
+  const lines = tail.split('\n').slice(1) // the first line may be cut
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let entry: { type?: string; message?: { content?: { type?: string; name?: string; input?: Record<string, unknown> }[] } }
+    try {
+      entry = JSON.parse(lines[i] ?? '')
+    } catch {
+      continue
+    }
+    if (entry.type !== 'assistant') continue
+    const uses = (entry.message?.content ?? []).filter(c => c.type === 'tool_use')
+    const use = uses[uses.length - 1]
+    if (!use?.name) continue
+    if (use.name === 'StructuredOutput') return { isDone: true, action: 'done' }
+    return { isDone: false, action: describe(use.name, use.input ?? {}) }
+  }
+  return { isDone: false, action: 'starting' }
+}
+
+async function workflowAgents($: EngineInterface, dir: string): Promise<Agent[]> {
+  const out: Agent[] = []
+  for (const entry of await $.fs.list(dir).catch(() => [])) {
+    const name = /^(agent-[^.]+)\.jsonl$/.exec(entry.name)?.[1]
+    if (!name) continue
+    let meta = metas.get(name)
+    if (!meta) {
+      try {
+        const m = JSON.parse(await $.fs.read(`${dir}/${name}.meta.json`))
+        meta = { label: String(m.description ?? ''), phase: String(m.workflowPhase ?? '') }
+        metas.set(name, meta)
+      } catch {
+        continue // written a moment after the transcript; the next poll has it
+      }
+    }
+    const known = agents.get(name)
+    if (known && (known.isDone || known.mtimeMs === entry.mtimeMs)) {
+      out.push(known)
+      continue
+    }
+    const tail = await $.process.run(['tail', '-c', String(TAIL_BYTES), `${dir}/${entry.name}`])
+    const ref = /:([^·\s]+)/.exec(meta.label)?.[1] ?? ''
+    const agent = { ...meta, ref, mtimeMs: entry.mtimeMs, ...lastAction(tail.exitCode === 0 ? tail.stdout : '') }
+    agents.set(name, agent)
+    out.push(agent)
+  }
+  return out
+}
+
+// How big the ticket's change is so far, staged or not, and the files it added.
+async function diffSize($: EngineInterface, worktree: string): Promise<string> {
+  const stat = await $.process.run(['git', '-C', worktree, 'diff', 'HEAD', '--shortstat'])
+  const added = await $.process.run(['git', '-C', worktree, 'ls-files', '--others', '--exclude-standard'])
+  const m = /(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/.exec(stat.stdout)
+  const fresh = added.exitCode === 0 ? added.stdout.split('\n').filter(Boolean).length : 0
+  const parts = m ? [`${m[1]} file${m[1] === '1' ? '' : 's'} +${m[2] ?? 0} −${m[3] ?? 0}`] : []
+  if (fresh) parts.push(`${fresh} new`)
+  return parts.join(', ')
+}
+
+const PHASE_OF = { Plan: 'Plan', Build: 'Build', Review: 'Review', Handoff: 'Handoff' } as const
 
 const parent = (dir: string) => dir.replace(/\/[^/]+\/?$/, '') || '/'
 
@@ -97,11 +182,35 @@ async function load($: EngineInterface): Promise<Snapshot | null> {
       risk: t.risk === 'high' ? 'high' : 'normal',
       why: t.why ?? '',
       running: (running.get(id) ?? []).sort(),
+      action: '',
+      diff: '',
     }
   })
 
+  // A Workflow run: what its agents are doing, from their transcripts.
+  let activityMs = newest.mtimeMs
+  if (run.engine === 'workflow' && run.workflow?.transcripts) {
+    const all = await workflowAgents($, run.workflow.transcripts)
+    activityMs = Math.max(activityMs, ...all.map(a => a.mtimeMs))
+    const now = await $.clock.now()
+    for (const t of tickets) {
+      const mine = all.filter(a => a.ref === t.ref).sort((a, b) => a.mtimeMs - b.mtimeMs)
+      const busy = mine.filter(a => !a.isDone)
+      const latest = busy[busy.length - 1]
+      if (t.phase !== 'Done' && mine.length) {
+        const phase = (latest ?? mine[mine.length - 1])?.phase as keyof typeof PHASE_OF
+        t.phase = PHASE_OF[phase] ?? t.phase
+        t.stage = (latest ?? mine[mine.length - 1])?.label.split(':')[0] ?? t.stage
+      }
+      t.running = busy.map(a => a.label.split(':')[0] ?? a.label)
+      if (latest) t.action = `${latest.action} · ${minutes(now - latest.mtimeMs)} ago`
+      const worktree = run.prepared?.find(p => p.id === t.id)?.worktree
+      if (worktree && t.phase !== 'Done' && t.phase !== 'Plan') t.diff = await diffSize($, worktree)
+    }
+  }
+
   // A ticket is in the batch once its implementer started; the later phases count only those.
-  const built = tickets.filter(t => files.has(`${t.id}.implement.prompt.md`))
+  const built = tickets.filter(t => files.has(`${t.id}.implement.prompt.md`) || (t.phase !== 'Plan' && t.status !== 'deferred'))
   const past = (t: TicketRow, phase: (typeof PHASES)[number]) =>
     t.phase === 'Done' || PHASES.indexOf(t.phase as (typeof PHASES)[number]) > PHASES.indexOf(phase)
   const phases: PhaseCount[] = PHASES.map(name => {
@@ -123,7 +232,7 @@ async function load($: EngineInterface): Promise<Snapshot | null> {
 
   return {
     runId: run.id ?? newest.name,
-    state: run.finished ? 'finished' : now - newest.mtimeMs > STALLED_MS ? 'stalled' : 'running',
+    state: run.finished ? 'finished' : now - activityMs > STALLED_MS ? 'stalled' : 'running',
     startedMs: started,
     updatedMs: run.finished ? Date.parse(run.finished) || newest.mtimeMs : now,
     tools,
@@ -152,6 +261,8 @@ const tone = (t: TicketRow) =>
   t.status === 'ready' || t.status === 'planned' ? 'success' : t.status === 'needs-human' ? 'error' : t.status === 'deferred' ? 'warning' : 'suggestion'
 const detail = (t: TicketRow) =>
   (t.phase === 'Done' ? t.why || t.status : t.running.length ? t.running.join(', ') : t.stage) +
+  (t.phase !== 'Done' && t.action ? ` · ${t.action}` : '') +
+  (t.diff ? ` · ${t.diff}` : '') +
   (t.rounds ? ` · ${t.rounds} fix round${t.rounds > 1 ? 's' : ''}` : '')
 const stateLabel = { running: 'running', finished: 'finished', stalled: 'no progress for 15 min (stopped?)' } as const
 const stateColor = { running: 'suggestion', finished: 'success', stalled: 'warning' } as const

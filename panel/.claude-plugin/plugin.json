@@ -1,7 +1,7 @@
 {
   "name": "agent-loop-panel",
-  "version": "0.2.0",
-  "description": "The progress of the current agent-loop run: a band above the prompt, and a full pane on /agent-loop-panel.",
+  "version": "0.3.0",
+  "description": "Live progress of the current agent-loop run above the prompt, from the agents' own transcripts; a full pane on /agent-loop-panel.",
   "types": "./types/index.d.ts",
   "license": "MIT",
   "author": {

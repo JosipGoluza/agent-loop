@@ -187,6 +187,9 @@ async function review(t, plan, round, ctx) {
   const suffix = round ? String(round) : ''
   const ran = await checks(t, plan, round)
   if (!ran) return null
+  const failing = ran.checks.filter(c => !c.ok).map(c => c.cmd)
+  log(`${ref(t)}: checks ${failing.length ? 'failing: ' + failing.join(', ') : `${ran.checks.length} passing`}` +
+    (ran.sensitive && ran.sensitive.length ? ` · high risk (${ran.sensitive.join(', ')})` : ''))
   const sensitive = ran.sensitive || []
   const lenses = LENSES.concat(sensitive.length && !LENSES.includes('security') ? ['security'] : [])
   const votes = sensitive.length ? VOTES : 1
@@ -217,6 +220,9 @@ async function review(t, plan, round, ctx) {
     found = found.filter(f => !('refuted' in f))
     if (refuted.length) log(`${ref(t)}: ${refuted.length} finding(s) refuted by the skeptics`)
   }
+  const blockingCount = found.filter(f => f.severity !== 'minor').length
+  log(`${ref(t)}: review${round ? ' round ' + round : ''} · ${blockingCount} blocking, ${found.length - blockingCount} minor` +
+    (refuted.length ? `, ${refuted.length} refuted` : '') + (preExisting.length ? `, ${preExisting.length} pre-existing` : ''))
   return { round, findings: found, preExisting, checks: ran.checks, refuted, sensitive, tree: ran.tree }
 }
 
@@ -234,6 +240,7 @@ async function build(t, plan) {
   const built = await agent(render('implement', values(t, plan, { plan: planMd })), { label: `build:${ref(t)}`, phase: 'Build', schema: S.build })
   if (!built) return { status: 'needs-human', why: 'implementer failed', rounds: 0, preExisting: [], confirmed: [] }
   if (built.stuck) return { status: 'needs-human', why: built.stuck, rounds: 0, preExisting: [], confirmed: [] }
+  log(`${ref(t)}: implemented, now reviewing`)
 
   let r = await review(t, plan, 0, {})
   const preExisting = r ? r.preExisting.slice() : []
@@ -242,6 +249,7 @@ async function build(t, plan) {
   while (r && blocking(r) && rounds < MAX_FIX) {
     rounds++
     const { todo, text } = fixList(r)
+    log(`${ref(t)}: fix round ${rounds} for ${todo.length} finding(s)`)
     const fixed = await agent(render('fix', values(t, plan, { round: rounds, findings: text })), { label: `fix${rounds}:${ref(t)}`, phase: 'Build', schema: S.build })
     const lastKeys = new Set(todo.map(classKey))
     const prevTree = r.tree
@@ -300,7 +308,10 @@ async function handoff(t, plan, res) {
 const built = await pipeline(
   batch,
   ({ t, plan }) => build(t, plan).catch(e => ({ status: 'needs-human', why: `build crashed: ${e && e.message}`, rounds: 0, preExisting: [], confirmed: [] })),
-  (res, { t, plan }) => handoff(t, plan, res).then(h => Object.assign({ t }, res, { handoff: h })),
+  (res, { t, plan }) => handoff(t, plan, res).then(h => {
+    log(`${ref(t)}: ${res.status === 'ready' ? 'ready to ship' : 'needs you: ' + res.why}`)
+    return Object.assign({ t }, res, { handoff: h })
+  }),
 )
 
 const done = built.filter(Boolean)

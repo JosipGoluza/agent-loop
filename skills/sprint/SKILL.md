@@ -44,6 +44,13 @@ shows its own progress view: the phases, each agent, and keys to look inside and
    ```
 
    Asking for this skill is the user's approval to run it.
+
+   The tool returns at once with a `Run ID` and a `Transcript dir`. Record them, so the
+   agent-loop panel can show what each agent does while the run continues:
+
+   ```bash
+   $AL wf attach <run> --wf <Run ID> --transcripts <Transcript dir>
+   ```
 3. When the workflow returns, write its result to `<runDir>/summary.json` (`runDir` is in the
    arguments) and run `$AL wf finish <run>`. The status skill, `findings` and the panel then see
    the run.

@@ -58,7 +58,7 @@ function project(on: any) {
   on('fs.list', (_: unknown, e: any) =>
     ({ value: e.path === `${STATE}/runs` ? [{ name: '20261027-113232', kind: 'dir', size: 0, mtimeMs: NOW, isLink: false }] : LISTING }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: NOW - 2000, isLink: false } }))
-  on('fs.read', (_: unknown, e: any) => (e.path in FILES ? { value: FILES[e.path] } : { error: 'ENOENT' }))
+  on('fs.read', (_: unknown, e: any) => (e.path in FILES ? { value: FILES[e.path] } : { deny: 'ENOENT' }))
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
 }
 
@@ -133,5 +133,75 @@ test('without a run the band makes way', async ($, on) => {
 
   const band = await $.ui.mount({ ...BAND(8), surface: 'terminal' })
   expect((await band.find({ type: 'Text' }))?.text).toBe('engine band')
+  await band.unmount()
+})
+
+// A Workflow run mid-build: the planner finished, #824's builder is editing, a reviewer of #825 just started.
+const WF = '/home/.claude/projects/x/session/subagents/workflows/wf_1'
+const WF_RUN = `${STATE}/runs/20261102-090000`
+const line = (content: unknown[]) => JSON.stringify({ type: 'assistant', message: { content } })
+const TRANSCRIPTS: Record<string, { label: string; phase: string; mtimeMs: number; tail: string }> = {
+  'agent-a1': { label: 'plan:#824', phase: 'Plan', mtimeMs: NOW - 600000,
+    tail: 'partial line…\n' + line([{ type: 'tool_use', name: 'StructuredOutput', input: {} }]) },
+  'agent-a2': { label: 'build:#824', phase: 'Build', mtimeMs: NOW - 20000,
+    tail: 'cut\n' + line([{ type: 'tool_use', name: 'Bash', input: { command: 'cd /w/824 && make check' } }]) + '\n' +
+      line([{ type: 'text', text: 'Now the endpoint.' }, { type: 'tool_use', name: 'Edit', input: { file_path: '/w/824/app/runs.py' } }]) },
+  'agent-a3': { label: 'spec:#825', phase: 'Review', mtimeMs: NOW - 5000, tail: 'cut\n' },
+}
+
+function workflowProject(on: any) {
+  on('session.root', () => ({ value: '/repo' }))
+  on('process.run', (_: unknown, e: any) => {
+    const argv: string[] = e.argv
+    if (argv[0] === 'tail') {
+      const name = /(agent-[^/.]+)\.jsonl$/.exec(argv[argv.length - 1] ?? '')?.[1] ?? ''
+      return { value: { exitCode: 0, stdout: TRANSCRIPTS[name]?.tail ?? '', stderr: '' } }
+    }
+    if (argv.includes('--shortstat')) return { value: { exitCode: 0, stdout: ' 3 files changed, 120 insertions(+), 4 deletions(-)\n', stderr: '' } }
+    if (argv.includes('ls-files')) return { value: { exitCode: 0, stdout: 'app/new.py\n', stderr: '' } }
+    return { value: { exitCode: 0, stdout: '/repo/.git\n', stderr: '' } }
+  })
+  on('clock.now', () => ({ value: NOW }))
+  on('clock.every', () => ({ value: undefined }))
+  on('command.register', () => ({ value: { command: 'agent-loop-panel' } }))
+  on('fs.exists', (_: unknown, e: any) => ({ value: e.path === `${STATE}/config.json` || e.path === `${STATE}/runs` }))
+  on('fs.list', (_: unknown, e: any) => {
+    if (e.path === `${STATE}/runs`) return { value: [{ name: '20261102-090000', kind: 'dir', size: 0, mtimeMs: NOW, isLink: false }] }
+    if (e.path === WF) {
+      return { value: Object.entries(TRANSCRIPTS).flatMap(([name, a]) => [
+        { name: `${name}.jsonl`, kind: 'file', size: 1, mtimeMs: a.mtimeMs, isLink: false },
+        { name: `${name}.meta.json`, kind: 'file', size: 1, mtimeMs: a.mtimeMs, isLink: false },
+      ]) }
+    }
+    return { value: [{ name: 'run.json', kind: 'file', size: 1, mtimeMs: NOW - 600000, isLink: false }] }
+  })
+  on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: NOW - 600000, isLink: false } }))
+  on('fs.read', (_: unknown, e: any) => {
+    if (e.path === `${WF_RUN}/run.json`) {
+      return { value: JSON.stringify({
+        id: '20261102-090000', started: '2026-10-27T11:30:00', finished: null, engine: 'workflow',
+        workflow: { id: 'wf_1', transcripts: WF },
+        prepared: [{ id: '824', ref: '#824', worktree: '/w/824' }, { id: '825', ref: '#825', worktree: '/w/825' }],
+        tickets: { '824': { ref: '#824', name: 'Show runs', stage: 'queued' }, '825': { ref: '#825', name: 'Filter runs', stage: 'queued' } },
+      }) }
+    }
+    const meta = /(agent-[^/.]+)\.meta\.json$/.exec(e.path)?.[1]
+    if (meta && TRANSCRIPTS[meta]) {
+      return { value: JSON.stringify({ description: TRANSCRIPTS[meta].label, workflowPhase: TRANSCRIPTS[meta].phase }) }
+    }
+    return { deny: 'ENOENT' }
+  })
+  on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
+}
+
+test('a Workflow run shows what each agent does now, from its transcript', async ($, on) => {
+  workflowProject(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND(8), surface: 'terminal' })
+
+  // a 10-minute build with a fresh transcript write is running, not "stalled"
+  expect((await band.find({ type: 'Text', text: /agent-loop/ }))?.text).toMatch(/running · 10m00s · Plan 2\/2  Build 1\/2  Review 0\/2/)
+  expect((await band.find({ type: 'Text', text: /#824/ }))?.text).toMatch(/#824 Show runs · build · Edit runs\.py · 20s ago · 3 files \+120 −4, 1 new/)
+  expect((await band.find({ type: 'Text', text: /#825/ }))?.text).toMatch(/#825 Filter runs · spec · starting · 5s ago/)
   await band.unmount()
 })

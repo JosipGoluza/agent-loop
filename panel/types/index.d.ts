@@ -9,6 +9,8 @@ export type TicketRow = {
   risk: 'high' | 'normal'
   why: string
   running: string[]
+  action: string // a Workflow agent's latest tool call and how long ago
+  diff: string // the size of the ticket's change so far
 }
 
 export type PhaseCount = { name: 'Plan' | 'Build' | 'Review' | 'Handoff'; done: number; total: number }

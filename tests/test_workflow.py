@@ -57,6 +57,10 @@ class WorkflowTest(unittest.TestCase):
                       "fix1:#1", "checks1:#1", "correctness1:#1", "handoff:#1"):
             self.assertIn(label, out["calls"])
         self.assertNotIn("verify:#1·2", out["calls"])                     # the pre-existing blocker skips the skeptic
+        # free progress lines in the native view's narrator area, at each stage boundary
+        for line in ("#1: implemented, now reviewing", "#1: checks 1 passing", "#1: review · 1 blocking, 0 minor, 1 pre-existing",
+                     "#1: fix round 1 for 1 finding(s)", "#1: ready to ship", "#5: needs you: the same issue survived a fix"):
+            self.assertTrue(any(l.startswith(line) for l in out["logs"]), (line, out["logs"]))
 
     def test_prompts(self):
         out = self.run_workflow(args(["1"]))
