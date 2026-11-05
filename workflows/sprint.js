@@ -123,32 +123,48 @@ phase('Plan')
 const plans = await parallel(A.tickets.map(t => () =>
   agent(render('plan', values(t)), { label: `plan:${ref(t)}`, phase: 'Plan', schema: S.plan })))
 
+const COMMITS = !!P.commitAtHandoff
 const batch = [], deferred = [], needsHuman = []
 const taken = new Map()
+const later = [] // { t, plan, on }: tickets that wait for others of this run (commit mode only)
 A.tickets.forEach((t, i) => {
   const plan = plans[i]
   if (!plan) return deferred.push({ id: t.id, ref: ref(t), reason: 'planner failed; run it again' })
   if (!plan.feasible) return needsHuman.push({ id: t.id, ref: ref(t), name: t.name, question: plan.question || plan.summary })
-  if (batch.length >= MAX_PARALLEL) return deferred.push({ id: t.id, ref: ref(t), reason: `over maxParallel (${MAX_PARALLEL})` })
+  const blockers = (t.waitFor || []).filter(id => A.tickets.some(x => x.id === id))
+  if (COMMITS && blockers.length) return later.push({ t, plan, on: new Set(blockers) })
   const mine = claims(plan)
-  const clash = [...mine].sort().find(c => taken.has(c))
-  if (clash) return deferred.push({ id: t.id, ref: ref(t), reason: `overlaps ${taken.get(clash)} on ${clash.replace(/^\w+:/, '')}` })
-  mine.forEach(c => taken.set(c, ref(t)))
+  const clashes = [...mine].sort().filter(c => taken.has(c))
+  if (clashes.length) {
+    if (COMMITS) return later.push({ t, plan, on: new Set(clashes.map(c => taken.get(c).id)) })
+    return deferred.push({ id: t.id, ref: ref(t), reason: `overlaps ${ref(taken.get(clashes[0]))} on ${clashes[0].replace(/^\w+:/, '')}` })
+  }
+  if (batch.length >= MAX_PARALLEL) {
+    if (COMMITS) return later.push({ t, plan, on: new Set() })
+    return deferred.push({ id: t.id, ref: ref(t), reason: `over maxParallel (${MAX_PARALLEL})` })
+  }
+  mine.forEach(c => taken.set(c, t))
   batch.push({ t, plan })
 })
 log(`Batch: ${batch.map(b => ref(b.t)).join(', ') || 'none'}`)
+for (const w of later) {
+  log(`${ref(w.t)}: waits for ${[...w.on].map(id => '#' + id).join(', ') || 'a free slot'}`)
+}
 if (deferred.length) log(`Deferred: ${deferred.map(d => `${d.ref} (${d.reason})`).join('; ')}`)
 if (needsHuman.length) log(`Needs you: ${needsHuman.map(n => n.ref).join(', ')}`)
 
 if (A.planOnly) {
-  return { stoppedAfter: 'plan', plans: batch.map(b => Object.assign({ id: b.t.id, ref: ref(b.t) }, b.plan)), deferred, needsHuman }
+  return {
+    stoppedAfter: 'plan', plans: batch.map(b => Object.assign({ id: b.t.id, ref: ref(b.t) }, b.plan)),
+    waiting: later.map(w => ({ id: w.t.id, ref: ref(w.t), waitsFor: [...w.on] })), deferred, needsHuman,
+  }
 }
 
 // ---- Build and review, per ticket, no barrier between tickets -------------------
 
 function checks(t, plan, round) {
   const files = (plan.files || []).join(',')
-  const cmd = `${A.al} wf checks ${t.worktree} --run ${A.run} --id ${t.id}${round ? ' --round ' + round : ''}${files ? ` --files '${files}'` : ''}`
+  const cmd = `${A.al} wf checks ${t.worktree} --run ${A.run} --id ${t.id} --base ${t.base}${round ? ' --round ' + round : ''}${files ? ` --files '${files}'` : ''}`
   return agent(
     `Run exactly this command and return its JSON output as your result, unchanged:\n\n\`\`\`bash\n${cmd}\n\`\`\`\n\nDo nothing else.`,
     { label: `checks${round || ''}:${ref(t)}`, phase: 'Review', schema: CHECKS, effort: 'low' })
@@ -305,19 +321,114 @@ async function handoff(t, plan, res) {
   return h || {}
 }
 
-const built = await pipeline(
-  batch,
-  ({ t, plan }) => build(t, plan).catch(e => ({ status: 'needs-human', why: `build crashed: ${e && e.message}`, rounds: 0, preExisting: [], confirmed: [] })),
-  (res, { t, plan }) => handoff(t, plan, res).then(h => {
-    log(`${ref(t)}: ${res.status === 'ready' ? 'ready to ship' : 'needs you: ' + res.why}`)
-    return Object.assign({ t }, res, { handoff: h })
-  }),
-)
+function finish(t, plan) {
+  return build(t, plan)
+    .catch(e => ({ status: 'needs-human', why: `build crashed: ${e && e.message}`, rounds: 0, preExisting: [], confirmed: [] }))
+    .then(res => handoff(t, plan, res).then(h => {
+      log(`${ref(t)}: ${res.status === 'ready' ? 'ready to ship' : 'needs you: ' + res.why}`)
+      return Object.assign({ t }, res, { handoff: h })
+    }))
+}
 
-const done = built.filter(Boolean)
+let done
+if (!COMMITS) {
+  // Without a commit at handoff nothing can build on a finished ticket: overlaps wait for the next run.
+  done = (await pipeline(batch, ({ t, plan }) => finish(t, plan))).filter(Boolean)
+} else {
+  // Tickets that overlap a running one, or that its tracker says wait for one, start when it is done:
+  // `wf stack` moves the waiting ticket onto the finished one's commit, a planner plans it again on
+  // the new code, and it starts unless it now overlaps another running ticket.
+  const results = new Map()      // id -> the finished ticket's result
+  const order = []               // ids in the order they finished
+  const holding = new Map()      // claim -> the running ticket that holds it
+  const running = new Map()      // id -> its chain
+  const stacks = new Map()       // id -> how many times it was moved onto another ticket
+  for (const n of needsHuman) results.set(n.id, { status: 'needs-human' })
+  for (const d of deferred) results.set(d.id, { status: 'deferred' })
+
+  const STACK = {
+    type: 'object', additionalProperties: false, required: ['ok', 'reason', 'base', 'tree'],
+    properties: { ok: { type: 'boolean' }, reason: { type: 'string' }, base: { type: 'string' }, tree: { type: 'string' } },
+  }
+
+  function start(t, plan) {
+    const mine = claims(plan)
+    mine.forEach(c => holding.set(c, t))
+    running.set(t.id, finish(t, plan).then(r => {
+      results.set(t.id, r)
+      order.push(t.id)
+      for (const c of mine) if (holding.get(c) === t) holding.delete(c)
+      running.delete(t.id)
+      return r
+    }))
+  }
+
+  async function restart(w) {
+    const onto = [...w.on].sort((a, b) => order.indexOf(b) - order.indexOf(a))[0]
+    const needs = [...w.on].filter(id => id !== onto)
+    const n = (stacks.get(w.t.id) || 0) + 1
+    stacks.set(w.t.id, n)
+    const cmd = `${A.al} wf stack ${A.run} --id ${w.t.id} --onto ${onto}${needs.length ? ' --needs ' + needs.join(',') : ''}`
+    const moved = await agent(
+      `Run exactly this command and return its JSON output as your result, unchanged:\n\n\`\`\`bash\n${cmd}\n\`\`\`\n\nDo nothing else.`,
+      { label: `stack${n > 1 ? n : ''}:${ref(w.t)}`, phase: 'Plan', schema: STACK, effort: 'low' })
+    if (!moved || !moved.ok) {
+      needsHuman.push({ id: w.t.id, ref: ref(w.t), name: w.t.name,
+        question: `cannot build on ${'#' + onto}: ${moved ? moved.reason : 'the stack step failed'}` })
+      results.set(w.t.id, { status: 'needs-human' })
+      return
+    }
+    const t = Object.assign({}, w.t, { base: moved.base })
+    log(`${ref(t)}: moved onto #${onto} (${moved.base}); planning again on the new code`)
+    const plan = await agent(render('plan', values(t)), { label: `plan${n + 1}:${ref(t)}`, phase: 'Plan', schema: S.plan })
+    if (!plan || !plan.feasible) {
+      needsHuman.push({ id: t.id, ref: ref(t), name: t.name, question: plan ? plan.question || plan.summary : 'the planner failed' })
+      results.set(t.id, { status: 'needs-human' })
+      return
+    }
+    return { t, plan }
+  }
+
+  // Start what is free; move waiting tickets whose blockers are done onto them.
+  async function wake() {
+    for (const w of later.slice()) {
+      if (running.size >= MAX_PARALLEL) break
+      if (![...w.on].every(id => results.has(id))) continue
+      later.splice(later.indexOf(w), 1)
+      const failed = [...w.on].filter(id => results.get(id).status !== 'ready')
+      if (failed.length) {
+        deferred.push({ id: w.t.id, ref: ref(w.t), reason: `waits on ${failed.map(id => '#' + id).join(', ')}, which did not finish ready` })
+        results.set(w.t.id, { status: 'deferred' })
+        continue
+      }
+      const next = w.on.size ? await restart(w) : { t: w.t, plan: w.plan }
+      if (!next) continue
+      const clashes = [...claims(next.plan)].filter(c => holding.has(c))
+      if (clashes.length) {
+        const on = new Set(clashes.map(c => holding.get(c).id))
+        log(`${ref(next.t)}: overlaps ${[...on].map(id => '#' + id).join(', ')} on ${clashes[0].replace(/^\w+:/, '')}; waits for it`)
+        later.push({ t: next.t, plan: next.plan, on })
+        continue
+      }
+      start(next.t, next.plan)
+    }
+  }
+
+  for (const { t, plan } of batch) start(t, plan)
+  await wake()
+  while (running.size) {
+    await Promise.race(running.values())
+    await wake()
+  }
+  for (const w of later) {
+    deferred.push({ id: w.t.id, ref: ref(w.t), reason: `waits on ${[...w.on].map(id => '#' + id).join(', ')}, which did not finish` })
+  }
+  done = [...results.values()].filter(r => r && r.t)
+}
+
 return {
   ready: done.filter(r => r.status === 'ready').map(r => ({
-    id: r.t.id, ref: ref(r.t), name: r.t.name, branch: r.t.branch, rounds: r.rounds,
+    id: r.t.id, ref: ref(r.t), name: r.t.name, branch: r.t.branch, base: r.t.base, rounds: r.rounds,
     risk: r.review && r.review.sensitive && r.review.sensitive.length ? 'high' : 'normal',
     preExisting: (r.preExisting || []).length,
     commitMessage: r.handoff.commitMessage, prTitle: r.handoff.prTitle, prChanges: r.handoff.prChanges,

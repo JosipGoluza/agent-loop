@@ -85,6 +85,10 @@ Ask these questions in one step:
   `.env`" and "install dependencies".
 - **Parallel tickets:** 3, 5 or 10. Each ticket uses four to six agent calls.
 - **Pull requests:** ready for review, or draft.
+- **Stacking:** commit each ready ticket locally at handoff (`commitAtHandoff`), so tickets that
+  overlap or wait for another ticket of the run stack on it in the same run. Nothing is pushed.
+  If `facts.agentsForbidCommits` is true, tell the user that this is a Python step, not an agent,
+  and ask them to confirm.
 - **Agent tools:** the tool for each stage. Offer the installed tools (`claude`, `codex`,
   `cursor-agent`). The default is the tool of this session. Suggest a different tool for
   `review` than for `implement`, for an independent review. This sets `agents.default` and the

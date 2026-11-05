@@ -38,6 +38,7 @@
     "file": "REVIEW.md"
   },
   "sensitivePaths": [],
+  "commitAtHandoff": false,
   "tracker": {
     "type": "trello",
     "columns": {

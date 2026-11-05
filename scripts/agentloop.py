@@ -92,6 +92,7 @@ DEFAULT_CONFIG = {
     "agentTimeoutMinutes": 30,
     "review": {"lenses": ["spec", "correctness", "standards"], "verify": True, "votes": 3, "file": "REVIEW.md"},
     "sensitivePaths": [],
+    "commitAtHandoff": False,
     "tracker": {
         "type": "trello",
         "columns": {"ready": "Sprint Backlog", "doing": "In Progress", "review": "Code Review"},
@@ -1120,8 +1121,13 @@ def run_setup(p: Project, wt: Path) -> list[dict]:
     return results
 
 
-def prepare(p: Project, s: Snapshot, ids: list[str], force: bool = False) -> tuple[list[dict], list[dict]]:
-    """Create or reuse each ticket's worktree and run setup; returns (prepared tickets, skipped ones)."""
+def prepare(p: Project, s: Snapshot, ids: list[str], force: bool = False,
+            waiting: dict[str, list[str]] | None = None) -> tuple[list[dict], list[dict]]:
+    """Create or reuse each ticket's worktree and run setup; returns (prepared tickets, skipped ones).
+
+    `waiting` maps a blocked ticket to the tickets of this same run it waits for: it is prepared
+    like a ready one and carries `waitFor`, so the workflow can start it once those are done."""
+    waiting = waiting or {}
     by = s.by_id()
     git(p.root, "fetch", "-q", "origin")
     tickets, skipped = [], []
@@ -1131,7 +1137,9 @@ def prepare(p: Project, s: Snapshot, ids: list[str], force: bool = False) -> tup
             continue
         t = classify(p, s, by[cid])
         wt = Path(t["worktree"])
-        if t["status"] == "blocked" and not force:
+        if t["status"] == "blocked" and cid in waiting:
+            t["waitFor"] = waiting[cid]
+        elif t["status"] == "blocked" and not force:
             skipped.append({**t, "error": t["reason"]})
             continue
         if not wt.exists():
@@ -1156,7 +1164,7 @@ def run_project(p: Project) -> dict:
     cfg = p.config
     return {"root": str(p.root), "dir": str(p.dir), "briefPath": str(p.dir / "brief.md"),
             "knowledgeIndex": str(knowledge.kdir(p.dir) / "INDEX.md") if knowledge.load(p.dir) else "",
-            **{k: cfg[k] for k in ("checks", "exclusive", "maxParallel", "maxFixRounds", "review", "sensitivePaths")}}
+            **{k: cfg[k] for k in ("checks", "exclusive", "maxParallel", "maxFixRounds", "review", "sensitivePaths", "commitAtHandoff")}}
 
 
 def cmd_prepare(a) -> None:
@@ -1219,6 +1227,52 @@ def cmd_run(a) -> None:
     print(json.dumps({"run": run.id, **summary}, indent=2))
 
 
+def commit_ticket(wt: Path, message: str) -> tuple[str, str]:
+    """Commit a ready ticket's staged change on its branch, locally: (commit, error).
+
+    A Python step makes this commit, not an agent, so a ticket waiting on this one can build on
+    it. Signing and commit hooks run as configured; push and the pull request wait for the ship
+    skill and the user's approval."""
+    if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode == 0:
+        return "", "nothing is staged"
+    out = subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", message], capture_output=True, text=True,
+                         stdin=subprocess.DEVNULL, timeout=300)
+    if out.returncode:
+        return "", (out.stderr or out.stdout).strip()[-500:] or f"exit {out.returncode}"
+    return git(wt, "rev-parse", "HEAD").strip(), ""
+
+
+def stack_ticket(p: Project, run, tid: str, onto: str, needs: list[str]) -> dict:
+    """Move a waiting ticket's worktree onto a finished ticket's commit, so it builds on that work.
+
+    The waiting ticket has only been planned: its worktree must hold no tracked change and no
+    commit past its base. The new base must contain the ticket's current base and every other
+    ticket it needs, or work would be lost: then it answers ok false with the reason."""
+    by = {t["id"]: t for t in run.tickets}
+    state = run.state().get("tickets") or {}
+    t, blocker = by.get(tid), by.get(onto)
+    if not t or not blocker:
+        return {"ok": False, "reason": f"#{tid} or #{onto} is not in this run", "base": "", "tree": ""}
+    for need in [onto, *needs]:
+        if (state.get(need) or {}).get("status") != "ready" or not (state.get(need) or {}).get("commit"):
+            return {"ok": False, "reason": f"{(by.get(need) or {}).get('ref', '#' + need)} is not committed and ready", "base": "", "tree": ""}
+    wt = Path(t["worktree"])
+    if git(wt, "status", "--porcelain", "--untracked-files=no", check=False).strip():
+        return {"ok": False, "reason": f"{t['ref']} has changes in its worktree", "base": "", "tree": ""}
+    if git(wt, "rev-list", "--count", f"{t['base']}..HEAD", check=False).strip() not in ("", "0"):
+        return {"ok": False, "reason": f"{t['ref']} has commits of its own", "base": "", "tree": ""}
+    target = blocker["branch"]
+    for must in [t["base"], *(by[n]["branch"] for n in needs if n in by)]:
+        if subprocess.run(["git", "-C", str(wt), "merge-base", "--is-ancestor", must, target]).returncode:
+            return {"ok": False, "reason": f"{blocker['ref']}'s branch does not contain {must}: the work is on separate branches",
+                    "base": "", "tree": ""}
+    git(wt, "reset", "-q", "--hard", target)
+    t["base"] = target
+    run.tickets = [t if x["id"] == tid else x for x in run.tickets]
+    run.update(prepared=run.tickets, ticket=(tid, {"stage": f"stacked on {blocker['ref']}"}))
+    return {"ok": True, "reason": "", "base": target, "tree": git(wt, "write-tree", check=False).strip()}
+
+
 def cmd_wf(a) -> None:
     """The steps of a Claude Code Workflow run that need files or git; the workflow script has neither.
 
@@ -1257,9 +1311,18 @@ def cmd_wf(a) -> None:
         wanted = ([a.target] if a.target else []) + a.ids
         ids = picked_ids(s, wanted) if wanted else [c["id"] for c in s.board.cards
                                                     if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
+        waiting: dict[str, list[str]] = {}
+        if p.config["commitAtHandoff"]:
+            by, pool = s.by_id(), set(ids)
+            if not wanted:  # also blocked Ready-column tickets whose blockers all run now
+                pool |= {c["id"] for c in s.board.cards if c["status"] == ready}
+            for cid in sorted(pool):
+                if cid in by and (c := classify(p, s, by[cid]))["status"] == "blocked" and set(c["blockers"]) <= pool:
+                    waiting[cid] = c["blockers"]
+            ids = list(dict.fromkeys(ids + [cid for cid in waiting if cid not in ids]))
         if not ids:
             raise SystemExit("No ready tickets.")
-        tickets, skipped = prepare(p, s, ids, a.force)
+        tickets, skipped = prepare(p, s, ids, a.force, waiting)
         for x in skipped:
             print(f"skipped {s.tracker.ref(x['id'])}: {x['error']}", file=sys.stderr)
         if not tickets:
@@ -1287,6 +1350,9 @@ def cmd_wf(a) -> None:
 
     run_dir = runs_dir(p) / a.target
     run = runner.Run.load(run_dir)
+    if a.action == "stack":
+        print(json.dumps(stack_ticket(p, run, a.id, a.onto, [x for x in (a.needs or "").split(",") if x])))
+        return
     if a.action == "attach":
         if not a.transcripts or not Path(a.transcripts).is_dir():
             raise SystemExit(f"No transcript folder at {a.transcripts}")
@@ -1296,14 +1362,27 @@ def cmd_wf(a) -> None:
         data = json.loads((run_dir / f"{a.id}.handoff.json").read_text())
         t = next(x for x in run.tickets if x["id"] == a.id)
         res = {"status": data.get("status", "needs-human"), "why": data.get("why", ""), "preExisting": data.get("preExisting") or []}
+        if res["status"] == "ready" and p.config["commitAtHandoff"]:
+            commit, error = commit_ticket(Path(t["worktree"]), (data.get("commitMessage") or "").strip() or t["name"])
+            if error:
+                res.update(status="needs-human", why=f"the handoff commit failed: {error}")
+            data["commit"] = commit
         path = runner.write_handoff_file(p.dir, run.id, t, res, data, data.get("sensitive") or [])
         (run_dir / f"{a.id}.review.json").write_text(json.dumps(
             {"findings": data.get("findings") or [], "preExisting": res["preExisting"]}, indent=2))
         run.update(ticket=(a.id, {"stage": "done", "status": res["status"], "why": res["why"], "rounds": data.get("rounds", 0),
-                                  "risk": "high" if data.get("sensitive") else "normal"}))
-        print(path)
+                                  "risk": "high" if data.get("sensitive") else "normal", "commit": data.get("commit") or ""}))
+        print(json.dumps({"path": str(path), "status": res["status"], "commit": data.get("commit") or ""}))
     elif a.action == "finish":
         summary = json.loads((run_dir / "summary.json").read_text())
+        # A handoff commit can fail after the workflow counted the ticket ready: run.json has the truth.
+        state = run.state().get("tickets") or {}
+        for r in list(summary.get("ready", [])):
+            now_ = state.get(r["id"]) or {}
+            if now_.get("status") and now_["status"] != "ready":
+                summary["ready"].remove(r)
+                summary.setdefault("needsHuman", []).append({"id": r["id"], "ref": r.get("ref"), "name": r.get("name"),
+                                                            "question": now_.get("why", "")})
         for d in summary.get("deferred", []):
             run.update(ticket=(d["id"], {"stage": "done", "status": "deferred", "why": d.get("reason", "")}))
         for n in summary.get("needsHuman", []):
@@ -1475,10 +1554,11 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--force", action="store_true"); x.add_argument("--resume"); x.add_argument("--detach", action="store_true")
     x.add_argument("--build", action="store_true", help="with --resume: carry a --plan run on into implementation"); x.set_defaults(fn=cmd_run)
     x = sub.add_parser("wf", help="steps of a Claude Code Workflow run")
-    x.add_argument("action", choices=["start", "checks", "attach", "handoff", "finish"])
+    x.add_argument("action", choices=["start", "checks", "stack", "attach", "handoff", "finish"])
     x.add_argument("target", nargs="?", help="checks: the worktree; handoff/finish: the run id")
     x.add_argument("ids", nargs="*"); x.add_argument("--plan", action="store_true"); x.add_argument("--force", action="store_true")
     x.add_argument("--id"); x.add_argument("--run"); x.add_argument("--round", type=int); x.add_argument("--base"); x.add_argument("--files")
+    x.add_argument("--onto", help="stack: the finished ticket to build on"); x.add_argument("--needs", help="stack: other finished tickets the new base must contain")
     x.add_argument("--wf", help="attach: the Workflow run id"); x.add_argument("--transcripts", help="attach: the Workflow transcript folder")
     x.set_defaults(fn=cmd_wf)
     x = sub.add_parser("status"); x.add_argument("run", nargs="?"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_status)

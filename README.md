@@ -156,6 +156,29 @@ Two tickets that change the same file do not run in the same batch. The same rul
 `exclusive` paths, for example lockfiles and migration folders. agent-loop holds the second
 ticket for a later run and tells you why.
 
+## Waiting tickets and stacked branches
+
+With `commitAtHandoff` on (Claude Code Workflow runs), a ticket that cannot start yet waits in the
+same run instead of stopping:
+
+- it overlaps a running ticket's files, or its tracker says another ticket of this run blocks it;
+- when that ticket is ready, a Python step has committed it on its branch (locally, not pushed);
+- `wf stack` moves the waiting ticket onto that commit, a planner plans it again on the new code,
+  and it starts. If it now overlaps another running ticket, it waits again and stacks on that one.
+
+The result is a stack of branches, for example `#856 → #841 → #842`. The ship skill pushes them in
+order and opens each PR against the branch below it. After a squash or rebase merge of a base,
+move the next branch onto `main` before you merge it.
+
+A ticket stops as *needs you* when its blocker did not finish ready, or when it needs work from
+two tickets on separate branches. With `commitAtHandoff` off, the loop commits nothing, and an
+overlapping ticket waits for the next run.
+
+The commit at handoff is made by `agentloop.py`, not by an agent, with your git identity, signing
+and commit hooks. If a hook fails, the ticket needs you. Push and pull requests still wait for your
+approval in the ship skill. In a repository whose `AGENTS.md` says that agents never commit, turn
+this on only when you accept these local commits.
+
 ## Review
 
 Each ticket gets a review before it gets to you:
@@ -241,6 +264,7 @@ To decrease the cost, decrease `review.lenses`, set `review.verify` to `false`, 
 | `agentArgs` | `{}` | More command-line arguments for each tool. |
 | `maxParallel` | `10` | The maximum number of tickets in one batch. |
 | `maxFixRounds` | `2` | The maximum number of fix rounds for each ticket. |
+| `commitAtHandoff` | `false` | Commit each ready ticket locally at handoff, so waiting tickets stack on it in the same run. |
 | `review` | 3 lenses, verify, 3 votes | `lenses`, `verify`, `votes`, `file` (`REVIEW.md`). |
 | `pr` | the repository template | The pull request template, the ticket line and draft mode. |
 

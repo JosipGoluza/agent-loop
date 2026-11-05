@@ -7,9 +7,11 @@ disable-model-invocation: true
 
 # Ship the ready tickets
 
-The loop stages its changes. It does not commit them. Many repositories let an agent run
-`git commit`, `git push` and `gh pr create` only after the user approves the exact command. This
-skill collects these commands for all ready tickets and asks the user one time.
+The loop stages its changes. With `commitAtHandoff` on, a Python step also commits each ready
+ticket on its branch, locally (the handoff note then has `commit:`), so that waiting tickets can
+build on it. Nothing is pushed. Many repositories let an agent run `git commit`, `git push` and
+`gh pr create` only after the user approves the exact command. This skill collects these commands
+for all ready tickets and asks the user one time.
 
 The CLI is `scripts/agentloop.py` in this plugin, two directories above this file:
 `AL="python3 <plugin root>/scripts/agentloop.py"`.
@@ -24,12 +26,20 @@ $AL handoffs --status ready
 If the user gave ticket ids, keep only those tickets. For each handoff, in its `worktree`:
 
 ```bash
-git -C <worktree> status --short          # staged changes must exist; unstaged changes must not
-git -C <worktree> diff --cached --stat
+git -C <worktree> status --short          # no unstaged changes; staged ones only when there is no `commit:`
+git -C <worktree> diff --cached --stat    # or, for a committed ticket: git -C <worktree> show --stat <commit>
 ```
+
+- **Committed ticket** (`commit:` in the handoff): the branch must have that commit, and nothing
+  else may be staged or changed.
+- **Staged ticket:** staged changes must exist.
 
 An unstaged change means that a person changed the worktree after the loop. Show the change.
 Do not ship that ticket until the user tells you what to do.
+
+**Stacked tickets:** a ticket whose `base` is another ticket's branch builds on that ticket. Ship
+in stack order, the base first, because its branch must be on the remote before the PR that
+targets it. If the user leaves the base out of this ship, leave its stacked tickets out too.
 
 ## 2. Prepare
 
@@ -59,18 +69,24 @@ For each ticket, show the diff stat, the **Open review findings**, the **Pre-exi
 (offer to make tickets for them) and the exact commands:
 
 ```bash
-git -C <worktree> commit -m "<handoff commit message>"
+git -C <worktree> commit -m "<handoff commit message>"      # leave out when the handoff has `commit:`
 git -C <worktree> push -u origin <branch>
 gh pr create -R <repo> --head <branch> --base <base> --title "<PR title>" --body-file <body file>   # add --draft when pr.draft is true
 ```
 
-Ask the user one time which tickets to ship. List all ready tickets. Use a multiple-choice
-question when you have a question tool. To ship a ticket is to run exactly its three commands.
+`<base>` is the handoff's `base`: `main`, or the branch of the ticket it is stacked on. For a
+stacked PR, say so in one line: "#841 is stacked on #856: merge #856 first. After a squash or
+rebase merge of #856, move #841 onto main (`git rebase --onto main <#856's branch>`) before you
+merge it."
+
+Ask the user one time which tickets to ship. List all ready tickets, in stack order. Use a
+multiple-choice question when you have a question tool. To ship a ticket is to run exactly its
+commands.
 
 ## 4. Ship
 
-For each selected ticket, run its three commands in sequence. If a command fails, stop that
-ticket and report the failure. When the PR is open, run:
+For each selected ticket, in stack order, run its commands in sequence. If a command fails, stop
+that ticket and the tickets stacked on it, and report the failure. When the PR is open, run:
 
 ```bash
 $AL mark <id> shipped --pr <pr url>

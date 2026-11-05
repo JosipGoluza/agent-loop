@@ -68,7 +68,7 @@ class WorkflowTest(unittest.TestCase):
         for label, text in p.items():
             self.assertNotIn("{{", text, label)
         self.assertIn("Run `cd /w/1` before anything else", p["build:#1"])
-        self.assertIn("python3 /plugin/scripts/agentloop.py wf checks /w/1 --run r1 --id 1 --files 'a.py'", p["checks:#1"])
+        self.assertIn("python3 /plugin/scripts/agentloop.py wf checks /w/1 --run r1 --id 1 --base origin/main --files 'a.py'", p["checks:#1"])
         self.assertIn("`git diff tree-1-checks tree-1-checks1`", p["correctness1:#1"])  # re-review sees only the fix
         self.assertIn("-- fixer: fixed: guarded", p["correctness1:#1"])
         self.assertIn("`REVIEW.md` at the worktree root", p["spec:#1"])
@@ -84,6 +84,53 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("security:#3", out["calls"])
         self.assertEqual(sorted(c for c in out["calls"] if c.startswith("verify")), ["verify:#3·1·v1", "verify:#3·1·v2", "verify:#3·1·v3"])
         self.assertEqual(out["result"]["needsHuman"][0]["ref"], "#3")      # 2 of 3 confirmed: it blocks
+
+    def test_waiting_tickets_stack_on_their_blocker_and_chain(self):
+        out = self.run_workflow(args(["1", "2", "7"], commitAtHandoff=True))
+        r, calls = out["result"], out["calls"]
+        self.assertEqual(sorted(x["ref"] for x in r["ready"]), ["#1", "#2", "#7"])
+        bases = {x["ref"]: x["base"] for x in r["ready"]}
+        self.assertEqual(bases, {"#1": "origin/main", "#2": "feat/1", "#7": "feat/2"})  # #7 waited twice: on #1, then on #2
+        for label in ("stack:#2", "plan2:#2", "build:#2", "stack:#7", "plan2:#7", "stack2:#7", "plan3:#7", "build:#7"):
+            self.assertIn(label, calls)
+        self.assertLess(calls.index("handoff:#1"), calls.index("stack:#2"))       # it waits for the handoff
+        self.assertLess(calls.index("handoff:#2"), calls.index("stack2:#7"))
+        self.assertIn("--base feat/2", out["prompts"]["checks:#7"])                # reviews diff against its blocker
+        self.assertIn("`feat/2`", out["prompts"]["build:#7"])
+        self.assertTrue(any(l.startswith("#7: overlaps #2 on a.py; waits for it") for l in out["logs"]), out["logs"])
+        self.assertEqual(r["deferred"], [])
+
+    def test_a_blocker_that_needs_you_leaves_its_waiter_deferred(self):
+        out = self.run_workflow(args(["5", "8"], commitAtHandoff=True))
+        r = out["result"]
+        self.assertEqual([n["ref"] for n in r["needsHuman"]], ["#5"])
+        self.assertEqual(r["deferred"], [{"id": "8", "ref": "#8", "reason": "waits on #5, which did not finish ready"}])
+        self.assertNotIn("stack:#8", out["calls"])                               # never stacked on unfinished work
+
+    def test_work_on_separate_branches_needs_you(self):
+        out = self.run_workflow(args(["1", "2"], commitAtHandoff=True), scenario="nostack")
+        r = out["result"]
+        self.assertEqual([x["ref"] for x in r["ready"]], ["#1"])
+        self.assertEqual(r["needsHuman"][0]["question"], "cannot build on #1: the work is on separate branches")
+        self.assertNotIn("build:#2", out["calls"])
+
+    def test_tracker_blocked_ticket_waits_and_stacks(self):
+        a = args(["3", "9"], commitAtHandoff=True)
+        a["tickets"][1]["waitFor"] = ["3"]
+        out = self.run_workflow(a)
+        r = out["result"]
+        self.assertEqual({x["ref"]: x["base"] for x in r["ready"]}, {"#3": "origin/main", "#9": "feat/3"})
+        self.assertLess(out["calls"].index("handoff:#3"), out["calls"].index("stack:#9"))
+
+    def test_without_commits_overlaps_wait_for_the_next_run(self):
+        out = self.run_workflow(args(["1", "2"]))
+        self.assertEqual(out["result"]["deferred"], [{"id": "2", "ref": "#2", "reason": "overlaps #1 on a.py"}])
+        self.assertNotIn("stack:#2", out["calls"])
+
+    def test_max_parallel_starts_later_tickets_in_turn(self):
+        out = self.run_workflow(args(["1", "3", "9"], commitAtHandoff=True, maxParallel=1))
+        self.assertEqual(sorted(x["ref"] for x in out["result"]["ready"]), ["#1", "#3", "#9"])
+        self.assertFalse(any(c.startswith("stack") for c in out["calls"]))       # waiting for a slot needs no stacking
 
     def test_plan_only(self):
         out = self.run_workflow(args(["1", "2"], plan_only=False) | {"planOnly": True})

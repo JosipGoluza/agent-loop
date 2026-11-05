@@ -19,9 +19,14 @@ function fake(prompt, opts) {
   prompts[label] = prompt
   const id = label.split('#')[1].split('·')[0]
   const kind = label.split(':')[0]
-  if (kind === 'plan') {
+  if (kind.startsWith('stack')) {
+    const onto = /--onto (\d+)/.exec(prompt)[1]
+    if (scenario === 'nostack') return { ok: false, reason: 'the work is on separate branches', base: '', tree: '' }
+    return { ok: true, reason: '', base: `feat/${onto}`, tree: `tree-stacked-${id}` }
+  }
+  if (kind.startsWith('plan')) {
     if (id === '6') return { feasible: false, question: 'which tenant?', summary: '', files: [], steps: [], risks: [], planMarkdown: '', knowledge: [] }
-    const files = { 1: ['a.py'], 2: ['a.py'], 3: ['text.py'], 5: ['c.py'] }[id] || ['x.py']
+    const files = { 1: ['a.py'], 2: ['a.py'], 3: ['text.py'], 5: ['c.py'], 7: ['a.py'], 8: ['c.py'], 9: ['z.py'] }[id] || ['x.py']
     return { feasible: true, question: null, summary: 's', files, steps: [], risks: [], planMarkdown: `# Plan ${id}`, knowledge: [] }
   }
   if (kind === 'build' || kind.startsWith('fix')) {

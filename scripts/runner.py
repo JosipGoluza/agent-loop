@@ -129,8 +129,11 @@ def write_handoff_file(state_dir: Path, run_id: str, t: dict, res: dict, h: dict
              f"updated: {now()}", f"run: {run_id}", f"risk: {'high' if sensitive else 'normal'}"]
     if sensitive:
         front.append(f"sensitive: {', '.join(sensitive)}")
+    if h.get("commit"):
+        front.append(f"commit: {h['commit']}")
     text = "\n".join(front + ["---", "",
-        "## Summary", (h.get("summary") or "").strip(), "",
+        "## Summary", (f"**Needs you:** {res['why']}\n\n" if res.get("why") and res.get("status") != "ready" else "")
+        + (h.get("summary") or "").strip(), "",
         "## Decisions", bullets(h.get("decisions")), "",
         "## Follow-ups", bullets(h.get("followUps")), "",
         "## Open review findings", bullets(h.get("openFindings")), "",
