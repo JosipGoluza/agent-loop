@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -285,6 +286,14 @@ class GitHubCloneLayoutTest(Base):
         self.run_cli("move", "11", "review")
         self.assertEqual(self.gh_calls[-1][-4:], ("--field", "Status", "--value", "In review"))
         self.assertIn("https://github.com/o/app/issues/11", self.gh_calls[-1])
+
+    def test_sibling_worktree_finds_the_checkouts_excluded_state_folder(self):
+        shutil.copytree(self.clone / ".git" / "agent-loop", self.clone / ".agent-loop")
+        out = json.loads(self.run_cli("prepare", "11"))
+        wt = Path(out["tickets"][0]["worktree"])
+        self.assertFalse((wt / ".agent-loop").exists())
+        p = al.find_project(wt)
+        self.assertEqual((p.root, p.dir), (self.clone, self.clone / ".agent-loop"))
 
     def test_doctor_passes(self):
         out = self.run_cli("doctor")

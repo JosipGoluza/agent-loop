@@ -155,6 +155,19 @@ def git_common_dir(start: Path) -> Path | None:
     return Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
 
 
+def main_worktree(start: Path) -> Path | None:
+    """The checkout a ticket worktree was cut from: a git-excluded `.agent-loop/` lives only there."""
+    out = subprocess.run(["git", "-C", str(start), "worktree", "list", "--porcelain"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    for entry in out.stdout.split("\n\n"):
+        lines = entry.splitlines()
+        if lines and lines[0].startswith("worktree ") and "bare" not in lines[1:]:
+            return Path(lines[0].removeprefix("worktree "))
+    return None
+
+
 def find_project(start: Path | None = None, config_file: Path | None = None) -> Project | None:
     here = (start or Path.cwd()).resolve()
     if config_file:
@@ -165,6 +178,10 @@ def find_project(start: Path | None = None, config_file: Path | None = None) -> 
         cfg = d / ".agent-loop" / "config.json"
         if cfg.is_file():
             return Project(d, cfg.parent, normalize(json.loads(cfg.read_text())))
+    main = main_worktree(here) if here.exists() else None
+    if main and (main / ".agent-loop" / "config.json").is_file():
+        cfg = main / ".agent-loop" / "config.json"
+        return Project(main, cfg.parent, normalize(json.loads(cfg.read_text())))
     common = git_common_dir(here) if here.exists() else None
     if common and (common / "agent-loop" / "config.json").is_file():
         cfg = common / "agent-loop" / "config.json"
