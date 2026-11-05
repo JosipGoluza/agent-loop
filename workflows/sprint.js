@@ -304,7 +304,7 @@ async function handoff(t, plan, res) {
     JSON.stringify(extra, null, 2),
     '```',
     '',
-    `Then run \`${A.al} wf handoff ${A.run} --id ${t.id}\`. It writes the handoff note and prints its path.`,
+    `Then run \`cd ${P.root} && ${A.al} wf handoff ${A.run} --id ${t.id}\`. It writes the handoff note (and, when the project commits at handoff, the commit) and prints the result.`,
   ].join('\n')
   const h = await agent(render('handoff', values(t, null, {
     status: res.status + (res.why ? ` (${res.why})` : ''),
@@ -368,7 +368,7 @@ if (!COMMITS) {
     const needs = [...w.on].filter(id => id !== onto)
     const n = (stacks.get(w.t.id) || 0) + 1
     stacks.set(w.t.id, n)
-    const cmd = `${A.al} wf stack ${A.run} --id ${w.t.id} --onto ${onto}${needs.length ? ' --needs ' + needs.join(',') : ''}`
+    const cmd = `cd ${P.root} && ${A.al} wf stack ${A.run} --id ${w.t.id} --onto ${onto}${needs.length ? ' --needs ' + needs.join(',') : ''}`
     const moved = await agent(
       `Run exactly this command and return its JSON output as your result, unchanged:\n\n\`\`\`bash\n${cmd}\n\`\`\`\n\nDo nothing else.`,
       { label: `stack${n > 1 ? n : ''}:${ref(w.t)}`, phase: 'Plan', schema: STACK, effort: 'low' })

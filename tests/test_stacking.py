@@ -99,6 +99,13 @@ class StackingTest(unittest.TestCase):
         state = json.loads((self.run_dir / "run.json").read_text())["tickets"]["1"]
         self.assertEqual((state["status"], state["commit"]), ("ready", out["commit"]))
 
+    def test_a_second_handoff_keeps_the_commit(self):
+        """A resumed run replays the handoff: the ticket stays ready on the commit it has."""
+        self.start("1")
+        first = self.finish_ready("1")["commit"]
+        again = json.loads(self.cli("wf", "handoff", self.run_id, "--id", "1"))
+        self.assertEqual((again["status"], again["commit"]), ("ready", first))
+
     def test_a_failing_commit_hook_makes_the_ticket_need_you(self):
         self.start("1")
         hook = Path(git("-C", str(self.clone), "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks" / "pre-commit"
@@ -171,6 +178,9 @@ class WithoutCommitsTest(StackingTest):
 
     def test_a_failing_commit_hook_makes_the_ticket_need_you(self):
         pass  # no commit, so no hook
+
+    def test_a_second_handoff_keeps_the_commit(self):
+        pass
 
     def test_stack_moves_a_waiting_ticket_onto_its_blockers_commit(self):
         pass

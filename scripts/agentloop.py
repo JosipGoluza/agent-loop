@@ -1227,13 +1227,16 @@ def cmd_run(a) -> None:
     print(json.dumps({"run": run.id, **summary}, indent=2))
 
 
-def commit_ticket(wt: Path, message: str) -> tuple[str, str]:
+def commit_ticket(wt: Path, message: str, base: str = "") -> tuple[str, str]:
     """Commit a ready ticket's staged change on its branch, locally: (commit, error).
 
     A Python step makes this commit, not an agent, so a ticket waiting on this one can build on
     it. Signing and commit hooks run as configured; push and the pull request wait for the ship
     skill and the user's approval."""
     if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode == 0:
+        # Already committed by an earlier handoff of this ticket (a resumed run): keep that commit.
+        if base and git(wt, "rev-list", "--count", f"{base}..HEAD", check=False).strip() not in ("", "0"):
+            return git(wt, "rev-parse", "HEAD").strip(), ""
         return "", "nothing is staged"
     out = subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", message], capture_output=True, text=True,
                          stdin=subprocess.DEVNULL, timeout=300)
@@ -1363,7 +1366,7 @@ def cmd_wf(a) -> None:
         t = next(x for x in run.tickets if x["id"] == a.id)
         res = {"status": data.get("status", "needs-human"), "why": data.get("why", ""), "preExisting": data.get("preExisting") or []}
         if res["status"] == "ready" and p.config["commitAtHandoff"]:
-            commit, error = commit_ticket(Path(t["worktree"]), (data.get("commitMessage") or "").strip() or t["name"])
+            commit, error = commit_ticket(Path(t["worktree"]), (data.get("commitMessage") or "").strip() or t["name"], t["base"])
             if error:
                 res.update(status="needs-human", why=f"the handoff commit failed: {error}")
             data["commit"] = commit

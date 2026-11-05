@@ -96,6 +96,8 @@ class WorkflowTest(unittest.TestCase):
         self.assertLess(calls.index("handoff:#1"), calls.index("stack:#2"))       # it waits for the handoff
         self.assertLess(calls.index("handoff:#2"), calls.index("stack2:#7"))
         self.assertIn("--base feat/2", out["prompts"]["checks:#7"])                # reviews diff against its blocker
+        self.assertIn("cd /repo && python3 /plugin/scripts/agentloop.py wf stack r1 --id 2 --onto 1", out["prompts"]["stack:#2"])
+        self.assertIn("cd /repo && python3 /plugin/scripts/agentloop.py wf handoff r1 --id 2", out["prompts"]["handoff:#2"])
         self.assertIn("`feat/2`", out["prompts"]["build:#7"])
         self.assertTrue(any(l.startswith("#7: overlaps #2 on a.py; waits for it") for l in out["logs"]), out["logs"])
         self.assertEqual(r["deferred"], [])
