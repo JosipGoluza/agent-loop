@@ -803,6 +803,17 @@ def brief(p: Project, s: Snapshot) -> str:
 
 # --- detect --------------------------------------------------------------------
 
+def session_host() -> str:
+    """Which tool is running this session: cursor, claude, codex, or "" when none of the markers is set."""
+    if os.environ.get("CURSOR_AGENT"):
+        return "cursor"
+    if os.environ.get("CLAUDECODE"):
+        return "claude"
+    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_THREAD_ID"):
+        return "codex"
+    return ""
+
+
 def make_targets(path: Path) -> list[str]:
     if not path.is_file():
         return []
@@ -895,6 +906,7 @@ def detect(start: Path, tracker_url: str | None) -> dict:
             "makeTargets": targets, "prTemplate": template,
             "reviewFile": (main / "REVIEW.md").is_file(),
             "agentsForbidCommits": bool(re.search(r"(?i)git commit.{0,120}(confirm|only after)", agents_md)),
+            "host": session_host(),
             "credentials": {
                 "trello": bool(os.environ.get("TRELLO_KEY") and os.environ.get("TRELLO_TOKEN")),
                 "jira": bool(os.environ.get("JIRA_EMAIL") and os.environ.get("JIRA_API_TOKEN")),

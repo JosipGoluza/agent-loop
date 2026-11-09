@@ -20,7 +20,10 @@ Outside a configured repository it says so; offer the setup skill.
 When the board is unavailable the brief says why. Usually the tracker's credentials are not
 exported in the shell that started the session (`TRELLO_KEY` + `TRELLO_TOKEN`, or
 `JIRA_EMAIL` + `JIRA_API_TOKEN`), or `gh` lacks the `project` scope for a GitHub board
-(`gh auth refresh -s project`). The user can export them into this session with
-`! export NAME=...`. Never write a credential into a file.
+(`gh auth refresh -s project`). In Claude Code the user can export them into this session
+with `! export NAME=...`. In Cursor the variables have to be in the environment of the Cursor
+process, so the user restarts Cursor and opens the Agent window again. In Codex the user
+exports them in the shell that starts Codex. Never write a credential into a file. Do not use
+`!` for Cursor window.
 
 Answer the user's question from the brief; do not paste the brief back at them.
