@@ -82,6 +82,11 @@ Reload Cursor (**Developer: Reload Window**). Make sure that the plugin shows in
 - On Enterprise plans, an administrator must enable **Allow Local Plugin Imports**.
 - The session hook does not run in Cursor cloud agents.
 
+Use the Agent window in the Cursor desktop app, with the repository open. Cloning the plugin
+into `~/.cursor/plugins/local` loads it there, so set the repository up and run the loop from
+that window. The Cursor CLI does not read that folder on its own. Pass `--plugin-dir` or enable
+the folder in `~/.cursor/settings.json` to load it there.
+
 ### Requirements
 
 - Python 3.10 or later. agent-loop uses only the standard library.

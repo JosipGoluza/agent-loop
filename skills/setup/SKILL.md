@@ -26,7 +26,8 @@ $AL detect                                   # or: $AL detect --tracker-url "<bo
 The output has two parts:
 
 - `facts`: the layout, the main checkout, the default branch, the remote, the Make targets, the
-  PR template, `reviewFile`, the exported tracker credentials and an existing configuration.
+  PR template, `reviewFile`, the tool running this session (`host`: `cursor`, `claude`, `codex`,
+  or empty), the exported tracker credentials and an existing configuration.
 - `config`: a suggested configuration.
 
 If `facts.existingConfig` has a value, this is a reconfiguration. Use the values in that file as
@@ -53,9 +54,17 @@ Then run `$AL detect --tracker-url "<url>"` again. It fills in the tracker.
   suggest `project = KEY AND statusCategory != Done ORDER BY Rank`.
 - **GitHub Projects:** if the column field has a name other than `Status`, set `statusField`.
 
-If the credentials are missing, give the user the command to run with `!`, for example
-`! export JIRA_EMAIL=... JIRA_API_TOKEN=...`. Wait for the user. Tell the user to also add the
-export to the shell that starts the agent tool.
+If the credentials are missing, follow `facts.host`. Wait until the variables are visible to
+this session before reading the columns. Do not write them in a file.
+
+- **claude:** give the command to run with `!`, for example
+  `! export JIRA_EMAIL=... JIRA_API_TOKEN=...`. Also tell the user to add the same export to
+  the shell that starts Claude Code.
+- **cursor:** the variables have to be in the environment of the Cursor process. Tell the user
+  to add the export there, quit Cursor, and open this repository again from the Agent window.
+  Do not use `!`.
+- **codex:** tell the user to export the variables in the shell that starts Codex.
+- **empty:** use the tool of this session.
 
 ## 3. Columns
 
