@@ -23,7 +23,7 @@ sprint ──► plan all tickets ──► batch the tickets that do not overla
                   implement ──► checks + review ──► fix ──► re-review ──► handoff note
                                      (max. maxFixRounds fix rounds)
 
-ship ──► you approve the commands ──► commit, push, pull request ──► you merge
+ship ──► commit, stack, resolve conflicts (local) ──► you approve ──► push, pull requests ──► you merge
 ```
 
 The changes stay staged in the worktree until you approve them.
@@ -134,7 +134,7 @@ plans, the handoff notes and the runs.
 | `ticket <id> [--plan]` | Run the loop on one ticket, also when it is blocked. |
 | `status [run]` | See which tickets are ready, which need you, and which waited. |
 | `ingest <path>` | Add transcripts, documents or test files to the project knowledge. |
-| `ship [ids]` | Commit, push and open the pull requests, after your approval. |
+| `ship [ids]` | Put the ready tickets into PR stacks, then push and open the pull requests after your approval. |
 
 In Claude Code, the skills are `/agent-loop:<skill>`. Codex and Cursor find them by name.
 
@@ -172,8 +172,7 @@ same run instead of stopping:
   and it starts. If it now overlaps another running ticket, it waits again and stacks on that one.
 
 The result is a stack of branches, for example `#856 → #841 → #842`. The ship skill pushes them in
-order and opens each PR against the branch below it. After a squash or rebase merge of a base,
-move the next branch onto `main` before you merge it.
+order and opens each PR against the branch below it.
 
 A ticket stops as *needs you* when its blocker did not finish ready, or when it needs work from
 two tickets on separate branches. With `commitAtHandoff` off, the loop commits nothing, and an
@@ -183,6 +182,40 @@ The commit at handoff is made by `agentloop.py`, not by an agent, with your git 
 and commit hooks. If a hook fails, the ticket needs you. Push and pull requests still wait for your
 approval in the ship skill. In a repository whose `AGENTS.md` says that agents never commit, turn
 this on only when you accept these local commits.
+
+## Pull request stacks
+
+The ship skill builds the stacks locally before it asks you. `pr.stack` sets their shape:
+
+- `sprint`: one stack for the whole sprint. Tickets that build on each other keep their order.
+  Independent tickets go on top, in the order they finished. If a ticket builds on a branch of
+  your own open stack, the new stack goes on top of that stack. A ticket that builds on someone
+  else's branch only targets that branch; it never joins their stack.
+- `chains` (default): only tickets that build on another ticket are stacked. The rest target
+  `main`.
+
+In `sprint` mode, each ticket is rebased in its own worktree onto the ticket below it. A ticket is
+one commit. If it has more (a fix you committed by hand), ship warns you and squashes them into one,
+named after the handoff commit message, only after you confirm. So a rebase stops at most once:
+
+- a conflict goes to one resolve agent. If it cannot resolve it, the rebase is aborted and you
+  rebase that ticket by hand;
+- then the checks run. If they fail, the branch is left as it is, conflicts resolved, for you to
+  fix;
+- when an agent changed code, one read-only combine review asks a single question: did combining
+  the two tickets drop or change either one's behaviour? Findings are shown with the resolution
+  diff when you approve; you decide.
+
+A stopped ticket stops its stack there. Nothing in that stack is published until it is fixed;
+ship offers to publish only the tickets below it if you ask. The next ship starts from the
+beginning: tickets already on the one below do not move, and the fixed ticket is checked again.
+`git -C <worktree> reflog` takes a branch back to before a ship.
+
+With the GitHub CLI extension [`gh stack`](https://gh.io/stacks) (`pr.ghStack`, on by default), ship
+links the pull requests into a stack on GitHub with `gh stack link`. Without it, the pull requests
+are only chained, each on the branch below. Merging is up to you. To keep the stack in one line
+after a branch changes, use **Rebase stack** on GitHub, or remove the ticket worktrees and use
+`gh stack rebase` and `gh stack sync` from the main checkout.
 
 ## Review
 
@@ -271,7 +304,7 @@ To decrease the cost, decrease `review.lenses`, set `review.verify` to `false`, 
 | `maxFixRounds` | `2` | The maximum number of fix rounds for each ticket. |
 | `commitAtHandoff` | `false` | Commit each ready ticket locally at handoff, so waiting tickets stack on it in the same run. |
 | `review` | 3 lenses, verify, 3 votes | `lenses`, `verify`, `votes`, `file` (`REVIEW.md`). |
-| `pr` | the repository template | The pull request template, the ticket line and draft mode. |
+| `pr` | the repository template | The pull request template, the ticket line, draft mode, `stack` (`chains` or `sprint`) and `ghStack`. |
 
 ## Runs
 

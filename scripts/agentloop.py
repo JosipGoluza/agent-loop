@@ -43,6 +43,7 @@ Commands:
     annotate ID [--summary S] [--use U] [--title T] [--kind K] [--date D] [--status new|distilled]
     handoffs [--status S]           handoff notes as JSON
     mark ID STATUS [--pr URL]       set a handoff's status (ready, needs-human, shipped)
+    stack plan|build [IDS] [--squash]  internal, for the ship skill: the PR stacks of the ready tickets
     move ID COLUMN_KEY              move a ticket to a configured column (ready, doing, review) or a named one
 """
 
@@ -104,6 +105,8 @@ DEFAULT_CONFIG = {
         "template": ".github/PULL_REQUEST_TEMPLATE.md",
         "ticketLine": "#### Ticket [{ref}]({url})",
         "draft": False,
+        "stack": "chains",
+        "ghStack": True,
     },
 }
 
@@ -1288,6 +1291,59 @@ def stack_ticket(p: Project, run, tid: str, onto: str, needs: list[str]) -> dict
     return {"ok": True, "reason": "", "base": target, "tree": git(wt, "write-tree", check=False).strip()}
 
 
+def cmd_stack(a) -> None:
+    """Internal, for the ship skill: the PR stacks of the ready tickets.
+
+    plan    which tickets go into which stack, in what order, on which base (changes nothing);
+            `squash` lists the rebased tickets with more than one commit
+    build   commit each staged ticket locally, rebase it onto the one below (with --squash,
+            squash a ticket with more commits into one first), resolve a conflict with one agent,
+            run the checks and one combine review, and print the push, PR and `gh stack link`
+            commands
+    """
+    import stacking
+    p = require_project(a.config)
+    cfg = p.config
+    t = tracker_for(p)
+    wanted = {t.norm_id(x) for x in a.ids}
+    ready = [h for h in handoffs(p) if h.get("status") == "ready" and (not wanted or h["id"] in wanted)]
+    if not ready:
+        raise SystemExit("No ready tickets to ship.")
+    prs, me, warnings = [], "", []
+    if cfg["repo"]:
+        try:
+            prs = gh_json("pr", "list", "-R", cfg["repo"], "--state", "open", "--limit", "100",
+                          "--json", "number,headRefName,baseRefName,author,url")
+            me = gh("api", "user", "--jq", ".login").strip()
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            warnings.append(f"GitHub unavailable, so no open stack is joined: {e}")
+    mode = cfg["pr"].get("stack") or "chains"
+    link = mode == "sprint" and bool(cfg["pr"].get("ghStack", True))
+    if link and not stacking.gh_stack_installed():
+        warnings.append("`gh stack` is not installed: the PRs are chained, but GitHub gets no stack "
+                        "(gh extension install github/gh-stack)")
+        link = False
+    stacks = stacking.plan(ready, stacking.trunk_of(cfg["base"]), mode, prs, me, link)
+    squash = []
+    for s in stacks:
+        for x in s["tickets"]:
+            own = stacking.own_commits(x["worktree"], x) if x["rebase"] and Path(x["worktree"]).is_dir() else []
+            if own and len(own) > 1:
+                squash.append({"ref": t.ref(x["id"]), "id": x["id"], "worktree": x["worktree"], "commits": len(own)})
+    if a.action == "build":
+        git(p.root, "fetch", "-q", "origin")
+        import adapters
+        builder = stacking.Builder(run_project(p), cfg, p.dir, stacking.run_dir_for(p.dir), adapters.run_agent, ref=t.ref,
+                                   squash=a.squash)
+        stacks = builder.build(stacks)
+        stacking.commands(stacks, cfg["repo"], str(p.root), p.dir, prs, bool(cfg["pr"].get("draft")))
+    keep = ("id", "title", "branch", "base", "parent", "worktree", "risk", "sensitive", "path", "rebase", "status", "reason",
+            "rebased", "resolved", "checks", "findings", "conflicts", "commit", "stat")
+    print(json.dumps({"mode": mode, "link": link, "warnings": warnings, "squash": squash, "stacks": [
+        {**{k: v for k, v in s.items() if k != "tickets"},
+         "tickets": [{"ref": t.ref(x["id"]), **{k: x[k] for k in keep if k in x}} for x in s["tickets"]]} for s in stacks]}, indent=2))
+
+
 def cmd_wf(a) -> None:
     """The steps of a Claude Code Workflow run that need files or git; the workflow script has neither.
 
@@ -1576,6 +1632,10 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--onto", help="stack: the finished ticket to build on"); x.add_argument("--needs", help="stack: other finished tickets the new base must contain")
     x.add_argument("--wf", help="attach: the Workflow run id"); x.add_argument("--transcripts", help="attach: the Workflow transcript folder")
     x.set_defaults(fn=cmd_wf)
+    x = sub.add_parser("stack", help="internal, for the ship skill: build the PR stacks of the ready tickets")
+    x.add_argument("action", choices=["plan", "build"]); x.add_argument("ids", nargs="*")
+    x.add_argument("--squash", action="store_true", help="the user confirmed: squash a ticket with more than one commit into one")
+    x.set_defaults(fn=cmd_stack)
     x = sub.add_parser("status"); x.add_argument("run", nargs="?"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_status)
     x = sub.add_parser("handoffs"); x.add_argument("--status"); x.set_defaults(fn=cmd_handoffs)
     x = sub.add_parser("mark"); x.add_argument("id"); x.add_argument("status", choices=["ready", "needs-human", "shipped"]); x.add_argument("--pr"); x.set_defaults(fn=cmd_mark)
