@@ -174,8 +174,13 @@ same run instead of stopping:
 The result is a stack of branches, for example `#856 → #841 → #842`. The ship skill pushes them in
 order and opens each PR against the branch below it.
 
-A ticket stops as *needs you* when its blocker did not finish ready, or when it needs work from
-two tickets on separate branches. With `commitAtHandoff` off, the loop commits nothing, and an
+When a ticket needs two tickets that are on separate branches, `wf stack` first puts one on top of
+the other, in its own worktree, then moves the waiting ticket onto the top one. A conflict or a
+failing check there goes to a resolve agent, and the ship skill runs the combine review on what that agent changed. A
+branch that another ticket of the run builds on is never moved.
+
+A ticket stops as *needs you* when its blocker did not finish ready, or when its blockers cannot be
+put in a line. With `commitAtHandoff` off, the loop commits nothing, and an
 overlapping ticket waits for the next run.
 
 The commit at handoff is made by `agentloop.py`, not by an agent, with your git identity, signing
