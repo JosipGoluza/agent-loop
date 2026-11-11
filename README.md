@@ -7,7 +7,7 @@ the project in each session or move work from one agent to the next.
   knowledge, the open pull requests and the notes of earlier agents.
 - **The loop does the tickets in parallel:** plan, implement, review, fix. Each ticket has its own
   git worktree.
-- **You approve and merge.** The agents do not commit, push or merge.
+- **You approve and merge.** The runner may commit locally at handoff; agents do not push or merge.
 
 It works with **Claude Code**, **Codex** and **Cursor**, and you can use a different tool for each
 stage. Trackers: Trello, GitHub Projects, Jira or a local `tickets.json` file. Repositories: GitHub.
@@ -23,10 +23,12 @@ sprint ──► plan all tickets ──► batch the tickets that do not overla
                   implement ──► checks + review ──► fix ──► re-review ──► handoff note
                                      (max. maxFixRounds fix rounds)
 
-ship ──► commit, stack, resolve conflicts (local) ──► you approve ──► push, pull requests ──► you merge
+ship ──► stack, resolve conflicts (local) ──► you approve ──► push, pull requests ──► you merge
 ```
 
-The changes stay staged in the worktree until you approve them.
+With `commitAtHandoff` on (the default), each ready ticket is committed locally at handoff. Push and
+pull requests wait for your approval in the ship skill. With it off, the changes stay staged until
+ship.
 
 ## Quick start
 
@@ -163,8 +165,8 @@ ticket for a later run and tells you why.
 
 ## Waiting tickets and stacked branches
 
-With `commitAtHandoff` on (Claude Code Workflow runs), a ticket that cannot start yet waits in the
-same run instead of stopping:
+With `commitAtHandoff` on (the default) in a Claude Code Workflow run, a ticket that cannot start
+yet waits in the same run instead of stopping:
 
 - it overlaps a running ticket's files, or its tracker says another ticket of this run blocks it;
 - when that ticket is ready, a Python step has committed it on its branch (locally, not pushed);
@@ -307,7 +309,7 @@ To decrease the cost, decrease `review.lenses`, set `review.verify` to `false`, 
 | `agentArgs` | `{}` | More command-line arguments for each tool. |
 | `maxParallel` | `10` | The maximum number of tickets in one batch. |
 | `maxFixRounds` | `2` | The maximum number of fix rounds for each ticket. |
-| `commitAtHandoff` | `false` | Commit each ready ticket locally at handoff, so waiting tickets stack on it in the same run. |
+| `commitAtHandoff` | `true` | Commit each ready ticket locally at handoff, so waiting tickets stack on it in the same run. |
 | `review` | 3 lenses, verify, 3 votes | `lenses`, `verify`, `votes`, `file` (`REVIEW.md`). |
 | `pr` | the repository template | The pull request template, the ticket line, draft mode, `stack` (`chains` or `sprint`) and `ghStack`. |
 

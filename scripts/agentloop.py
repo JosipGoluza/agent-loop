@@ -93,7 +93,7 @@ DEFAULT_CONFIG = {
     "agentTimeoutMinutes": 30,
     "review": {"lenses": ["spec", "correctness", "standards"], "verify": True, "votes": 3, "file": "REVIEW.md"},
     "sensitivePaths": [],
-    "commitAtHandoff": False,
+    "commitAtHandoff": True,
     "tracker": {
         "type": "trello",
         "columns": {"ready": "Sprint Backlog", "doing": "In Progress", "review": "Code Review"},
@@ -910,6 +910,7 @@ def detect(start: Path, tracker_url: str | None) -> dict:
             "reviewFile": (main / "REVIEW.md").is_file(),
             "agentsForbidCommits": bool(re.search(r"(?i)git commit.{0,120}(confirm|only after)", agents_md)),
             "host": session_host(),
+            "ghStack": __import__("stacking").gh_stack_installed(),
             "credentials": {
                 "trello": bool(os.environ.get("TRELLO_KEY") and os.environ.get("TRELLO_TOKEN")),
                 "jira": bool(os.environ.get("JIRA_EMAIL") and os.environ.get("JIRA_API_TOKEN")),
@@ -1038,6 +1039,12 @@ def cmd_doctor(a) -> None:
             target = shlex.split(cmd)[1] if len(shlex.split(cmd)) > 1 else ""
             ok = not target or target in make_targets(p.main / "Makefile")
         check(ok, f"command `{cmd}`", "install it or change checks/setup")
+    stack = cfg["pr"].get("stack") or "chains"
+    check(stack in ("chains", "sprint"), f"pr.stack is {stack}", "set pr.stack to \"chains\" or \"sprint\"")
+    if stack == "sprint" and cfg["pr"].get("ghStack", True):
+        import stacking
+        check(stacking.gh_stack_installed(), "gh stack installed (links each sprint's PRs into a GitHub stack)",
+              "gh extension install github/gh-stack, or set pr.ghStack to false for chained PRs without a GitHub stack")
     tpl = cfg["pr"].get("template")
     check(not tpl or (p.main / tpl).is_file(), f"PR template {tpl or '(none)'}", "fix pr.template or set it to \"\"")
     if not all(results):
