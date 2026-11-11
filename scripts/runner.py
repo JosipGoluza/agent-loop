@@ -374,19 +374,26 @@ class Loop:
             self.run.update(ticket=(t["id"], {"trees": trees}))
         return trees[step]
 
-    def risk(self, t: dict, plan: dict) -> list[str]:
-        """The sensitive paths the ticket's plan or staged change touches (empty: normal risk)."""
+    def risk(self, t: dict, plan: dict, round_: int = 0) -> list[str]:
+        """The sensitive paths the ticket's plan or staged change touches (empty: normal risk).
+
+        Looked at again in every review round, since a fix can touch one; each round's answer is
+        recorded, so a resumed run asks the same reviewers."""
         if not self.sensitive:
             return []
         state = self.ticket_state(t)
-        if "sensitive" in state:
-            return state["sensitive"]
-        changed = git_out(t["worktree"], "diff", "--cached", "--name-only", t["base"]).splitlines()
-        hits = sensitive_matches(list(plan.get("files") or []) + changed, self.sensitive)
-        self.run.update(ticket=(t["id"], {"risk": "high" if hits else "normal", "sensitive": hits}))
-        if hits:
-            self.run.log(f"{t['ref']} high risk: touches {', '.join(hits)}")
-        return hits
+        rounds = state.get("sensitiveRounds")
+        if rounds is None and "sensitive" in state:
+            return state["sensitive"]  # a run saved before rounds were recorded
+        rounds = rounds or {}
+        if str(round_) not in rounds:
+            changed = git_out(t["worktree"], "diff", "--cached", "--name-only", t["base"]).splitlines()
+            hits = sensitive_matches(list(plan.get("files") or []) + changed, self.sensitive)
+            if hits and hits != state.get("sensitive"):
+                self.run.log(f"{t['ref']} high risk: touches {', '.join(hits)}")
+            rounds[str(round_)] = hits
+            self.run.update(ticket=(t["id"], {"risk": "high" if hits else "normal", "sensitive": hits, "sensitiveRounds": rounds}))
+        return rounds[str(round_)]
 
     def review_file_note(self, t: dict) -> str:
         if self.review_file and (Path(t["worktree"]) / self.review_file).is_file():
@@ -438,7 +445,7 @@ class Loop:
         """
         suffix = str(round_) if round_ else ""
         checks = self.check_results(t, round_)
-        sensitive = self.risk(t, plan)
+        sensitive = self.risk(t, plan, round_)
         planned = list(plan.get("files") or [])
         changed = git_out(t["worktree"], "diff", "--cached", "--name-only", t["base"]).splitlines()
         outside = out_of_plan(changed, planned, self.scope_ignore)
@@ -611,38 +618,34 @@ class Loop:
 
     def restack(self, t: dict, on: set, order: list[str], n: int) -> tuple[dict, dict | None, str]:
         """Move waiting ticket `t` onto the finished tickets `on` and plan it again there:
-        (ticket, plan, why it needs a human). `n` counts the ticket's moves in this run; a move a
-        stopped run already made is not made again."""
+        (ticket, plan, why it needs a human). `n` counts the ticket's moves in this run. The stack
+        step leaves alone a ticket that a stopped run already moved, so a resume is safe."""
         by = {x["id"]: x for x in self.run.tickets}
         onto = max(on, key=order.index)  # the one that finished last
         needs = sorted(on - {onto})
-        if len(self.ticket_state(t).get("stacked") or []) < n:
-            moved: dict = {}
-            for _ in range(RESOLVE_ROUNDS):
-                try:
-                    moved = self.stack(t["id"], onto, needs) or {}
-                except Exception as e:  # noqa: BLE001
-                    moved = {"ok": False, "reason": str(e)}
-                ask = moved.get("resolve")
-                if not ask:
-                    break
-                # Blockers on separate branches go in a line first; a conflict or a failing check
-                # there gets a resolve agent, then the stack step carries on from where it stopped.
-                x = by[ask["id"]]
-                k = self.ticket_state(x).get("resolves", 0) + 1  # a new label each time: a resume never reuses an old answer
-                self.run.update(ticket=(x["id"], {"resolves": k}))
-                self.run.log(f"{x['ref']}: {ask['why']}; a resolve agent combines them for {t['ref']}")
-                self.call(x, f"resolve{k}", "fix", ask["prompt"], "build")
-                self.run.update(ticket=(x["id"], {"stage": "done"}))
-            if not moved.get("ok"):
-                why = moved.get("reason") or (f"{moved['resolve']['ref']} still {moved['resolve']['why']}" if moved.get("resolve")
-                                              else "the stack step failed")
-                return t, None, f"cannot build on {by[onto]['ref']}: {why}"
-            t = next((x for x in self.run.tickets if x["id"] == t["id"]), t)
-            t["base"] = moved["base"]
-            self.run.update(ticket=(t["id"], {"stacked": (self.ticket_state(t).get("stacked") or []) + [moved["base"]]}))
-        else:
-            t = next((x for x in self.run.tickets if x["id"] == t["id"]), t)
+        moved: dict = {}
+        for _ in range(RESOLVE_ROUNDS):
+            try:
+                moved = self.stack(t["id"], onto, needs) or {}
+            except Exception as e:  # noqa: BLE001
+                moved = {"ok": False, "reason": str(e)}
+            ask = moved.get("resolve")
+            if not ask:
+                break
+            # Blockers on separate branches go in a line first; a conflict or a failing check
+            # there gets a resolve agent, then the stack step carries on from where it stopped.
+            x = by[ask["id"]]
+            k = self.ticket_state(x).get("resolves", 0) + 1  # a new label each time: a resume never reuses an old answer
+            self.run.update(ticket=(x["id"], {"resolves": k}))
+            self.run.log(f"{x['ref']}: {ask['why']}; a resolve agent combines them for {t['ref']}")
+            self.call(x, f"resolve{k}", "fix", ask["prompt"], "build")
+            self.run.update(ticket=(x["id"], {"stage": "done"}))
+        if not moved.get("ok"):
+            why = moved.get("reason") or (f"{moved['resolve']['ref']} still {moved['resolve']['why']}" if moved.get("resolve")
+                                          else "the stack step failed")
+            return t, None, f"cannot build on {by[onto]['ref']}: {why}"
+        t = next((x for x in self.run.tickets if x["id"] == t["id"]), t)
+        t["base"] = moved["base"]
         self.run.log(f"{t['ref']}: moved onto {by[onto]['ref']} ({t['base']}); planning again on the new code")
         plan = self.plan(t, f"plan{n + 1}")  # a new label: the first plan was made on the old base
         if not plan or not plan["feasible"]:

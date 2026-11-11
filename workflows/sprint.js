@@ -1,8 +1,8 @@
 export const meta = {
   name: 'sprint',
-  description: 'Plan, implement, review and fix a batch of tickets in parallel worktrees, ending with staged changes and a handoff note per ticket',
+  description: 'Plan, implement, review and fix a batch of tickets in parallel worktrees, ending with a reviewed change (committed locally by default) and a handoff note per ticket',
   whenToUse:
-    'Invoked by the agent-loop sprint and ticket skills in Claude Code. Requires the JSON that `agentloop.py wf start` prints (prompts, schemas, project, tickets, run). Never commits or pushes; the ship skill does that after the user confirms.',
+    'Invoked by the agent-loop sprint and ticket skills in Claude Code. Requires the JSON that `agentloop.py wf start` prints (prompts, schemas, project, tickets, run). With `commitAtHandoff` on, `wf handoff` commits each ready ticket locally; otherwise the change stays staged. Never pushes; the ship skill does that after the user confirms.',
   phases: [
     { title: 'Plan', detail: 'one planner per ticket, in its worktree' },
     { title: 'Build', detail: 'implement, then fix what the review confirmed' },
@@ -333,6 +333,7 @@ async function handoff(t, plan, res) {
   const last = lastReviewText(r, res.lastRan)
   const file = `${A.runDir}/${t.id}.handoff.json`
   const extra = { status: res.status, why: res.why || '', rounds: res.rounds, sensitive, outOfPlan: (r && r.outOfPlan) || [], preExisting: pre,
+    plan: plan.planMarkdown || '',
     findings: (res.confirmed || []).map(f => ({ severity: f.severity, class: f.class, file: f.file, issue: f.issue, lens: f.lens, introduced: f.introduced })) }
   const saveNote = [
     '## Save the handoff',
@@ -345,7 +346,7 @@ async function handoff(t, plan, res) {
     '',
     `Then run \`cd ${P.root} && ${A.al} wf handoff ${A.run} --id ${t.id}\`. It writes the handoff note (and, when the project commits at handoff, the commit) and prints the result.`,
   ].join('\n')
-  const h = await agent(render('handoff', values(t, null, {
+  const prompt = render('handoff', values(t, null, {
     status: res.status + (res.why ? ` (${res.why})` : ''),
     plan: plan.planMarkdown || plan.summary || '',
     stat: '(read it with `git diff --cached --stat ' + t.base + '`)',
@@ -356,16 +357,20 @@ async function handoff(t, plan, res) {
     preExistingNote: pre.length ? 'Problems the reviewers found in code this change did not touch (listed separately as pre-existing; do not repeat them in openFindings):\n' + pre.map(f => '- ' + findingText(f).split('\n')[0]).join('\n') : '',
     riskNote: sensitive.length ? `This change touches sensitive paths (${sensitive.join(', ')}); say in \`risk\` what a human reviewer must check there.` : '',
     saveNote,
-  })), { label: `handoff:${ref(t)}`, phase: 'Handoff', schema: S.handoff, effort: 'low' })
-  return h || {}
+  }))
+  // The handoff writes the note and the commit: one failed agent gets a second try.
+  return await agent(prompt, { label: `handoff:${ref(t)}`, phase: 'Handoff', schema: S.handoff, effort: 'low' })
+    || await agent(prompt, { label: `handoff2:${ref(t)}`, phase: 'Handoff', schema: S.handoff, effort: 'low' })
 }
 
 function finish(t, plan) {
   return build(t, plan)
     .catch(e => ({ status: 'needs-human', why: `build crashed: ${e && e.message}`, rounds: 0, preExisting: [], confirmed: [] }))
     .then(res => handoff(t, plan, res).then(h => {
+      // No handoff: no note and no commit, so nothing can ship it or build on it.
+      if (!h && res.status === 'ready') res = Object.assign({}, res, { status: 'needs-human', why: 'the handoff step failed twice; run the ticket again' })
       log(`${ref(t)}: ${res.status === 'ready' ? 'ready to ship' : 'needs you: ' + res.why}`)
-      return Object.assign({ t }, res, { handoff: h })
+      return Object.assign({ t }, res, { handoff: h || {} })
     }))
 }
 

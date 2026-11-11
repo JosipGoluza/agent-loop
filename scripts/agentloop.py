@@ -1344,7 +1344,8 @@ def stack_ticket(p: Project, run, tid: str, onto: str, needs: list[str]) -> dict
     The waiting ticket has only been planned: its worktree must hold no tracked change and no
     commit past its base. When it needs finished tickets that are on separate branches, they are
     put in a line first, each on the one before (`reline`), and it goes on the top one. A branch
-    that another ticket of the run builds on is never moved. A conflict or a failing check answers
+    that another ticket of the run builds on is never moved. A ticket that an earlier call already
+    moved there is left alone. A conflict or a failing check answers
     `resolve`: the caller runs that agent, then calls this again, which carries on."""
     def fail(reason: str) -> dict:
         return {"ok": False, "reason": reason, "base": "", "tree": "", "resolve": None}
@@ -1356,21 +1357,28 @@ def stack_ticket(p: Project, run, tid: str, onto: str, needs: list[str]) -> dict
         return fail(f"#{tid} or #{onto} is not in this run")
     for need in [onto, *needs]:
         if (state.get(need) or {}).get("status") != "ready" or not (state.get(need) or {}).get("commit"):
-            return fail(f"{(by.get(need) or {}).get('ref', '#' + need)} is not committed and ready")
+            return fail(f"{(by.get(need) or {}).get('ref', '#' + need)} is not committed and ready; "
+                        f"finish it first (its handoff note says what it needs), then run {t['ref']} again")
     wt = Path(t["worktree"])
-    if git(wt, "status", "--porcelain", "--untracked-files=no", check=False).strip():
-        return fail(f"{t['ref']} has changes in its worktree")
-    if git(wt, "rev-list", "--count", f"{t['base']}..HEAD", check=False).strip() not in ("", "0"):
-        return fail(f"{t['ref']} has commits of its own")
-
     import stacking
     contains = lambda a, b: stacking.is_ancestor(wt, b, a)  # noqa: E731
     members = list(dict.fromkeys(n for n in [*needs, onto] if n in by))
+    if t["base"] in {x["branch"] for x in run.tickets if x["id"] != tid} and all(contains("HEAD", by[m]["branch"]) for m in members):
+        # An earlier call moved it there (a resumed run asks again): it may hold work by now, so it stays as it is.
+        return {"ok": True, "reason": "", "base": t["base"], "tree": git(wt, "write-tree", check=False).strip(), "resolve": None}
+    if git(wt, "status", "--porcelain", "--untracked-files=no", check=False).strip():
+        return fail(f"{t['ref']} has changes in its worktree ({wt}); commit or discard them, then run it again")
+    ahead = git(wt, "rev-list", "--count", f"{t['base']}..HEAD", check=False).strip()
+    if ahead not in ("", "0"):
+        return fail(f"{t['ref']} has commits of its own: its branch is {ahead} ahead of {t['base']} "
+                    f"(`git -C {wt} log {t['base']}..HEAD`); if they are not this ticket's work, run "
+                    f"`git -C {wt} reset --hard {t['base']}`, then run it again")
     tips = [m for m in members if not any(o != m and contains(by[o]["branch"], by[m]["branch"]) for o in members)]
     for below, x in zip(tips, tips[1:]):
         users = [u["ref"] for u in run.tickets if u["id"] not in (tid, x) and u.get("base") == by[x]["branch"]]
         if users:
-            return fail(f"{by[x]['ref']} cannot move onto {by[below]['ref']}: {', '.join(users)} build on it")
+            return fail(f"{by[x]['ref']} cannot move onto {by[below]['ref']}: {', '.join(users)} build on it; "
+                        f"ship those first, then run {t['ref']} again")
         stop = reline(p, run, by[x], by[below])
         if stop:
             return {**fail(stop.get("reason", "")), "resolve": stop.get("resolve")}
@@ -1378,7 +1386,12 @@ def stack_ticket(p: Project, run, tid: str, onto: str, needs: list[str]) -> dict
     top = by[tips[-1]]
     for must in [t["base"], *(by[n]["branch"] for n in members)]:
         if not contains(top["branch"], must):
-            return fail(f"{top['ref']}'s branch does not contain {must}: the work is on separate branches")
+            if must == t["base"]:
+                behind = git(wt, "rev-list", "--count", f"{top['branch']}..{must}", check=False).strip() or "some"
+                return fail(f"{top['ref']}'s branch is {behind} commit(s) behind {must}; rebase it "
+                            f"(`git -C {top['worktree']} rebase {must}`), then run {t['ref']} again")
+            return fail(f"{top['ref']}'s branch does not contain {must}: the work is on separate branches; "
+                        f"rebase {top['branch']} onto {must}, then run {t['ref']} again")
     target = top["branch"]
     git(wt, "reset", "-q", "--hard", target)
     t["base"] = target
@@ -1446,7 +1459,7 @@ def cmd_wf(a) -> None:
 
     start     prepare the tickets and the run folder; print the workflow's arguments
     checks    run the checks in a worktree; report the risky paths and the staged tree
-    handoff   write a ticket's handoff note from <run dir>/<id>.handoff.json
+    handoff   write a ticket's handoff note and plan file from <run dir>/<id>.handoff.json; commit it
     attach    record the Workflow's id and transcript folder, so the panel can show live progress
     finish    record the workflow's summary (<run dir>/summary.json) in run.json
     """
@@ -1530,6 +1543,9 @@ def cmd_wf(a) -> None:
                 res.update(status="needs-human", why=f"the handoff commit failed: {error}")
             data["commit"] = commit
         path = runner.write_handoff_file(p.dir, run.id, t, res, data, data.get("sensitive") or [], data.get("outOfPlan") or [])
+        if (data.get("plan") or "").strip():  # the workflow has no files: the plan reaches plans/<id>.md here
+            (p.dir / "plans").mkdir(exist_ok=True)
+            (p.dir / "plans" / f"{a.id}.md").write_text(data["plan"].strip() + "\n")
         (run_dir / f"{a.id}.review.json").write_text(json.dumps(
             {"findings": data.get("findings") or [], "preExisting": res["preExisting"]}, indent=2))
         run.update(ticket=(a.id, {"stage": "done", "status": res["status"], "why": res["why"], "rounds": data.get("rounds", 0),
@@ -1537,14 +1553,16 @@ def cmd_wf(a) -> None:
         print(json.dumps({"path": str(path), "status": res["status"], "commit": data.get("commit") or ""}))
     elif a.action == "finish":
         summary = json.loads((run_dir / "summary.json").read_text())
-        # A handoff commit can fail after the workflow counted the ticket ready: run.json has the truth.
+        # run.json has the truth: a handoff commit can fail after the workflow counted the ticket
+        # ready, and a handoff that never ran leaves no note and no commit.
         state = run.state().get("tickets") or {}
         for r in list(summary.get("ready", [])):
             now_ = state.get(r["id"]) or {}
-            if now_.get("status") and now_["status"] != "ready":
+            if now_.get("status") != "ready" or (p.config["commitAtHandoff"] and not now_.get("commit")):
+                why = now_.get("why") if now_.get("status") in ("needs-human", "deferred") else ""
                 summary["ready"].remove(r)
                 summary.setdefault("needsHuman", []).append({"id": r["id"], "ref": r.get("ref"), "name": r.get("name"),
-                                                            "question": now_.get("why", "")})
+                                                            "question": why or "the handoff step did not finish; run the ticket again"})
         for d in summary.get("deferred", []):
             run.update(ticket=(d["id"], {"stage": "done", "status": "deferred", "why": d.get("reason", "")}))
         for n in summary.get("needsHuman", []):
