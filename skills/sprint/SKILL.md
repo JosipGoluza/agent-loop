@@ -1,14 +1,16 @@
 ---
 name: sprint
-description: Plan, implement, review and fix every ready ticket on the board in parallel, one agent chain per ticket in its own worktree, ending with staged changes and a handoff note per ticket. Runs in the background; check it with the agent-loop status skill.
+description: Plan, implement, review and fix every ready ticket on the board in parallel, one agent chain per ticket in its own worktree, ending with a reviewed change (committed locally by default) and a handoff note per ticket. Runs in the background; check it with the agent-loop status skill.
 argument-hint: "[ticket ids...] [--plan]"
 disable-model-invocation: true
 ---
 
 # Run the sprint loop
 
-When the user asks for this skill, start the loop. The loop stops at staged, reviewed changes. It
-does not commit, push or open a PR. The ship skill does that, after the user approves.
+When the user asks for this skill, start the loop. The loop stops at reviewed changes. With
+`commitAtHandoff` on (the default), it commits each ready ticket locally on its branch; otherwise
+the change stays staged. It never pushes or opens a PR. The ship skill does that, after the user
+approves.
 
 The CLI is `scripts/agentloop.py` in this plugin, two directories above this file:
 `AL="python3 <plugin root>/scripts/agentloop.py"`.

@@ -75,6 +75,7 @@ class StackingTest(unittest.TestCase):
         (self.run_dir / f"{tid}.handoff.json").write_text(json.dumps({
             "summary": "s", "decisions": [], "followUps": [], "openFindings": [], "commitMessage": message or f"feat: ticket {tid}",
             "prTitle": "T", "prChanges": [], "testing": "", "risk": "", "revert": "", "status": "ready", "why": "", "rounds": 0,
+            "plan": f"# Plan {tid}",
             "sensitive": [], "preExisting": [], "findings": []}))
         return json.loads(self.cli("wf", "handoff", self.run_id, "--id", tid))
 
@@ -98,6 +99,7 @@ class StackingTest(unittest.TestCase):
         self.assertIn(f"commit: {out['commit']}", note)
         state = json.loads((self.run_dir / "run.json").read_text())["tickets"]["1"]
         self.assertEqual((state["status"], state["commit"]), ("ready", out["commit"]))
+        self.assertEqual((self.state / "plans" / "1.md").read_text(), "# Plan 1\n")  # the workflow's plan reaches the plans folder
 
     def test_a_second_handoff_keeps_the_commit(self):
         """A resumed run replays the handoff: the ticket stays ready on the commit it has."""
@@ -126,17 +128,34 @@ class StackingTest(unittest.TestCase):
         prepared = {t["id"]: t for t in json.loads((self.run_dir / "run.json").read_text())["prepared"]}
         self.assertEqual(prepared["2"]["base"], "feat/1-one")
         # its handoff then records the stacked base, which the ship skill uses as the PR base
-        self.finish_ready("2")
+        two = self.finish_ready("2")["commit"]
         self.assertIn("base: feat/1-one", (self.state / "handoffs" / "2.md").read_text())
+        # a resumed run asks again: the ticket has built by now and stays as it is
+        again = json.loads(self.cli("wf", "stack", self.run_id, "--id", "2", "--onto", "1"))
+        self.assertEqual((again["ok"], again["base"]), (True, "feat/1-one"))
+        self.assertEqual(git("-C", str(self.worktree("2")), "rev-parse", "HEAD"), two)
 
     def test_stack_guards(self):
         self.start()
         out = json.loads(self.cli("wf", "stack", self.run_id, "--id", "2", "--onto", "1"))
-        self.assertEqual((out["ok"], out["reason"]), (False, "#1 is not committed and ready"))
+        self.assertIn("#1 is not committed and ready; finish it first", out["reason"])
         self.finish_ready("1")
         (self.worktree("2") / "a.py").write_text("changed\n")
         out = json.loads(self.cli("wf", "stack", self.run_id, "--id", "2", "--onto", "1"))
-        self.assertEqual((out["ok"], out["reason"]), (False, "#2 has changes in its worktree"))
+        self.assertIn("#2 has changes in its worktree", out["reason"])
+        self.assertIn("commit or discard them", out["reason"])
+        git("-C", str(self.worktree("2")), "checkout", "-q", "a.py")
+        # the base moved on after #1 was cut: each reason says how to unblock the ticket
+        (self.clone / "new.py").write_text("n = 1\n")
+        git("-C", str(self.clone), "add", "-A")
+        git("-C", str(self.clone), "commit", "-qm", "main moves on")
+        git("-C", str(self.clone), "push", "-q", "origin", "main")
+        out = json.loads(self.cli("wf", "stack", self.run_id, "--id", "2", "--onto", "1"))
+        self.assertIn("#1's branch is 1 commit(s) behind origin/main; rebase it", out["reason"])
+        git("-C", str(self.worktree("2")), "commit", "-q", "--allow-empty", "-m", "old work")
+        out = json.loads(self.cli("wf", "stack", self.run_id, "--id", "2", "--onto", "1"))
+        self.assertIn("#2 has commits of its own: its branch is 1 ahead of origin/main", out["reason"])
+        self.assertIn("reset --hard origin/main", out["reason"])
 
     def stack(self, tid, onto, needs=""):
         return json.loads(self.cli("wf", "stack", self.run_id, "--id", tid, "--onto", onto, *(["--needs", needs] if needs else [])))
@@ -217,6 +236,15 @@ class StackingTest(unittest.TestCase):
         self.assertEqual(summary["ready"], [])
         self.assertIn("the handoff commit failed", summary["needsHuman"][0]["question"])
 
+    def test_finish_does_not_count_a_ticket_without_a_handoff_as_ready(self):
+        self.start("1")
+        (self.run_dir / "summary.json").write_text(json.dumps({"ready": [{"id": "1", "ref": "#1", "name": "One"}], "needsHuman": [], "deferred": []}))
+        self.cli("wf", "finish", self.run_id)
+        state = json.loads((self.run_dir / "run.json").read_text())
+        self.assertEqual(state["summary"]["ready"], [])
+        self.assertIn("the handoff step did not finish", state["summary"]["needsHuman"][0]["question"])
+        self.assertEqual(state["tickets"]["1"]["status"], "needs-human")
+
 
 class WithoutCommitsTest(StackingTest):
     """With commitAtHandoff off, nothing changes: no commit, blocked tickets stay out of the run."""
@@ -259,6 +287,9 @@ class WithoutCommitsTest(StackingTest):
         pass
 
     def test_finish_trusts_run_json_over_the_workflow_summary(self):
+        pass
+
+    def test_finish_does_not_count_a_ticket_without_a_handoff_as_ready(self):
         pass
 
 
