@@ -59,6 +59,9 @@ def fake_http(method, url, headers=None, data=None):
     raise AssertionError(url)
 
 
+ME = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+
+
 def sh(*cmd, cwd=None):
     subprocess.run(cmd, cwd=cwd, check=True, capture_output=True)
 
@@ -200,6 +203,39 @@ class TrelloBareLayoutTest(Base):
         self.assertEqual(json.loads(self.run_cli("tickets", "901"))[0]["status"], "in-flight")
         forced = json.loads(self.run_cli("prepare", "902", "--force"))["tickets"][0]
         self.assertTrue(forced["created"])
+
+    def push_904(self):
+        """The branch of PR #40, one commit ahead of the trunk, on the remote."""
+        wt = self.root / "904"
+        sh("git", "-C", str(self.root / ".git"), "worktree", "add", "-q", "-b", "feat/904-store-run-files", str(wt), "origin/main")
+        (wt / "store.py").write_text("s = 1\n")
+        sh("git", "-C", str(wt), "add", "store.py")
+        sh("git", "-C", str(wt), *ME, "commit", "-qm", "feat: store run files")
+        sh("git", "-C", str(wt), "push", "-q", "origin", "feat/904-store-run-files")
+        sh("git", "-C", str(self.root / ".git"), "fetch", "-q", "origin")
+
+    def test_a_started_ticket_keeps_the_branch_it_is_stacked_on(self):
+        self.push_904()
+        stacked = "origin/feat/904-store-run-files"
+        self.assertEqual(json.loads(self.run_cli("prepare", "903"))["tickets"][0]["base"], stacked)
+        again = json.loads(self.run_cli("tickets", "903"))[0]
+        # made on #904's branch, so ahead of the trunk from the start: still untouched, not "in flight"
+        self.assertEqual((again["status"], again["base"]), ("ready", stacked))
+        (self.root / "903" / "export.py").write_text("")
+        al.git(self.root / "903", "add", "export.py")
+        started = json.loads(self.run_cli("prepare", "903"))["tickets"][0]   # a second run of the ticket
+        self.assertEqual((started["status"], started["base"]), ("in-flight", stacked))
+
+    def test_a_ticket_rebased_by_hand_reports_the_branch_it_sits_on(self):
+        self.push_904()
+        wt = self.root / "906"
+        self.assertEqual(json.loads(self.run_cli("tickets", "906"))[0]["base"], "origin/main")
+        sh("git", "-C", str(wt), *ME, "commit", "-qm", "feat: already started")
+        sh("git", "-C", str(wt), *ME, "rebase", "-q", "origin/feat/904-store-run-files")
+        got = json.loads(self.run_cli("tickets", "906"))[0]
+        self.assertEqual((got["status"], got["base"]), ("in-flight", "origin/feat/904-store-run-files"))
+        # #904's own worktree sits under #906's commits: #906 is never its base
+        self.assertEqual(json.loads(self.run_cli("tickets", "904"))[0]["base"], "origin/main")
 
     def test_handoffs_and_mark(self):
         d = self.root / ".agent-loop" / "handoffs"
