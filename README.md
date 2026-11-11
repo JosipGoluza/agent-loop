@@ -220,6 +220,17 @@ ship offers to publish only the tickets below it if you ask. The next ship start
 beginning: tickets already on the one below do not move, and the fixed ticket is checked again.
 `git -C <worktree> reflog` takes a branch back to before a ship.
 
+You can rebase a ready ticket onto another branch by hand before you ship, for example onto one of
+your open pull requests. Ship reads where each branch sits from git, not from the handoff note. It
+tells you when the two differ, and it corrects the note. It also sets the ticket's risk from what
+the ticket changes on top of its parent. If the ticket sits on a branch that has no pull request
+and no ready ticket, ship stops and names that branch. It never squashes another branch's commits
+into the ticket.
+
+If you changed the branch of an open pull request below a ticket and did not push it, ship stops
+and gives you the push command. It does not move the ticket back onto the pushed copy. A ticket
+that you ran again for review feedback ships again into its open pull request.
+
 With the GitHub CLI extension [`gh stack`](https://gh.io/stacks) (`pr.ghStack`, on by default), ship
 links the pull requests into a stack on GitHub with `gh stack link`. Without it, the pull requests
 are only chained, each on the branch below. Merging is up to you. To keep the stack in one line

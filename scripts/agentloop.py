@@ -622,9 +622,11 @@ def slug_of(card: dict) -> str:
     return f"{card['id'].lower()}-{words}"[:70].rstrip("-")
 
 
-def worktree_in_use(p: Project, ticket_id: str, path: str) -> bool:
-    """A ticket's worktree holds work when it has changes, commits past the base, or a handoff note.
-    An untouched one (prepared, then deferred) is reused rather than blocking the ticket."""
+def worktree_in_use(p: Project, ticket_id: str, path: str, base: str = "") -> bool:
+    """A ticket's worktree holds work when it has changes, commits past its base, or a handoff note.
+    An untouched one (prepared, then deferred) is reused rather than blocking the ticket. `base` is
+    the branch it sits on: a worktree made on another ticket's branch is ahead of the trunk from
+    the start."""
     if (p.dir / "handoffs" / f"{ticket_id}.md").is_file():
         return True
     wt = Path(path)
@@ -632,8 +634,25 @@ def worktree_in_use(p: Project, ticket_id: str, path: str) -> bool:
         return False
     if git(wt, "status", "--porcelain", "--untracked-files=no", check=False).strip():
         return True  # untracked files alone (a copied .env, caches) are setup, not work
-    ahead = git(wt, "rev-list", "--count", f"{p.config['base']}..HEAD", check=False).strip()
+    ahead = git(wt, "rev-list", "--count", f"{base or p.config['base']}..HEAD", check=False).strip()
     return ahead not in ("", "0")
+
+
+def worktree_base(p: Project, s: Snapshot, card: dict, branch: str, path: str) -> str:
+    """The base of a ticket that already has a worktree: the branch its work sits on, read from git.
+
+    Its blockers' branches come first, then every other open PR and ticket worktree. A branch
+    that builds on this ticket (a PR onto its branch, a ticket it blocks) is above it, never its base."""
+    import stacking
+    cid, cards = card["id"], s.by_id()
+    note = p.dir / "handoffs" / f"{cid}.md"
+    h = read_handoff(note) if note.is_file() else {}
+    above = {x["headRefName"] for x in s.open_prs if x["baseRefName"] == branch}
+    above |= {b for b in s.worktrees if cid in (cards.get(s.branch_id(b) or "") or {}).get("blockers", [])}
+    first = [x["headRefName"] for b in card["blockers"] if (x := s.pr_for(b))]
+    rest = [x["headRefName"] for x in s.open_prs] + [b for b in s.worktrees if s.branch_id(b)]
+    branches = [b for b in dict.fromkeys(first + rest) if b != branch and b not in above]
+    return stacking.sits_on(path, branches, p.config["base"], noted=h.get("base", ""), own=h.get("commit", ""))
 
 
 def classify(p: Project, s: Snapshot, card: dict) -> dict:
@@ -658,9 +677,15 @@ def classify(p: Project, s: Snapshot, card: dict) -> dict:
     base, status, reason = p.config["base"], "ready", ""
     wt, pr = s.worktree_for(cid), s.pr_for(cid)
     ref = s.tracker.ref
+    # Started work keeps the base it really has: a second run of a stacked ticket must not see the
+    # trunk, or its diff, its risk paths and its handoff `base:` take in the branch below it.
+    if wt and Path(wt[1]).is_dir():
+        base = worktree_base(p, s, card, *wt)
+    elif pr:
+        base = f"origin/{pr['baseRefName']}"
     if pr:
         status, reason = "in-flight", f"PR #{pr['number']} open"
-    elif wt and worktree_in_use(p, cid, wt[1]):
+    elif wt and worktree_in_use(p, cid, wt[1], base):
         status, reason = "in-flight", f"worktree {wt[1]}"
     elif open_blockers:
         stack = [s.pr_for(b) for b in open_blockers]
@@ -1432,7 +1457,27 @@ def cmd_stack(a) -> None:
         warnings.append("`gh stack` is not installed: the PRs are chained, but GitHub gets no stack "
                         "(gh extension install github/gh-stack)")
         link = False
-    stacks = stacking.plan(ready, stacking.trunk_of(cfg["base"]), mode, prs, me, link)
+    if a.action == "build":
+        git(p.root, "fetch", "-q", "origin")
+    # A handoff's `base:` is what the loop wrote. Where the branch sits now comes from git: the
+    # developer may have rebased the ticket onto another branch since.
+    trunk = stacking.trunk_of(cfg["base"])
+    for h in ready:
+        if not Path(h.get("worktree") or "").is_dir():
+            continue
+        above = {x["headRefName"] for x in prs if x["baseRefName"] == h["branch"]} | {x["branch"] for x in ready if x.get("base") == h["branch"]}
+        branches = [b for b in dict.fromkeys([x["headRefName"] for x in prs] + [x["branch"] for x in ready])
+                    if b != h["branch"] and b not in above]
+        noted = h.get("base") or trunk
+        h["sitsOn"] = stacking.sits_on(h["worktree"], branches, cfg["base"], noted=noted, own=h.get("commit", ""))
+        real = stacking.trunk_of(h["sitsOn"])
+        if real != noted:
+            pr = next((f" (PR #{x['number']})" for x in prs if x["headRefName"] == real), "")
+            warnings.append(f"{t.ref(h['id'])}: its handoff says base `{noted}`, but its branch sits on `{real}`{pr}; ship uses `{real}`")
+            h["base"] = real
+            if a.action == "build":
+                stacking.set_meta(Path(h["path"]), "base", real)
+    stacks = stacking.plan(ready, trunk, mode, prs, me, link)
     squash = []
     for s in stacks:
         for x in s["tickets"]:
@@ -1441,7 +1486,6 @@ def cmd_stack(a) -> None:
             if own and len(own) > 1:
                 squash.append({"ref": t.ref(x["id"]), "id": x["id"], "worktree": x["worktree"], "commits": len(own)})
     if a.action == "build":
-        git(p.root, "fetch", "-q", "origin")
         import adapters
         builder = stacking.Builder(run_project(p), cfg, p.dir, stacking.run_dir_for(p.dir), adapters.run_agent, ref=t.ref,
                                    squash=a.squash)
