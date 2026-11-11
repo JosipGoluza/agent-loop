@@ -1149,7 +1149,7 @@ def prepare(p: Project, s: Snapshot, ids: list[str], force: bool = False,
     """Create or reuse each ticket's worktree and run setup; returns (prepared tickets, skipped ones).
 
     `waiting` maps a blocked ticket to the tickets of this same run it waits for: it is prepared
-    like a ready one and carries `waitFor`, so the workflow can start it once those are done."""
+    like a ready one and carries `waitFor`, so the run can start it once those are done."""
     waiting = waiting or {}
     by = s.by_id()
     git(p.root, "fetch", "-q", "origin")
@@ -1201,6 +1201,25 @@ def runs_dir(p: Project) -> Path:
     return p.dir / "runs"
 
 
+def select_tickets(p: Project, s: Snapshot, wanted: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """The tickets of a new run: (ids, waiting). Without `wanted`, every ready ticket of the Ready
+    column. When the project commits at handoff, also the blocked ones whose blockers all run in
+    this run: `waiting` maps each of them to those blockers, and it starts when they are done."""
+    ready = p.config["tracker"]["columns"]["ready"]
+    ids = picked_ids(s, wanted) if wanted else [c["id"] for c in s.board.cards
+                                                if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
+    waiting: dict[str, list[str]] = {}
+    if p.config["commitAtHandoff"]:
+        by, pool = s.by_id(), set(ids)
+        if not wanted:  # also blocked Ready-column tickets whose blockers all run now
+            pool |= {c["id"] for c in s.board.cards if c["status"] == ready}
+        for cid in sorted(pool):
+            if cid in by and (c := classify(p, s, by[cid]))["status"] == "blocked" and set(c["blockers"]) <= pool:
+                waiting[cid] = c["blockers"]
+        ids = list(dict.fromkeys(ids + [cid for cid in waiting if cid not in ids]))
+    return ids, waiting
+
+
 def cmd_run(a) -> None:
     """Start a run (prepare the tickets, then the loop), or resume one."""
     import runner
@@ -1217,14 +1236,10 @@ def cmd_run(a) -> None:
         s = snapshot(p)
         if not s.board.cards:
             raise SystemExit("\n".join(s.errors) or "The board has no tickets.")
-        if a.ids:
-            ids = picked_ids(s, a.ids)
-        else:
-            ready = p.config["tracker"]["columns"]["ready"]
-            ids = [c["id"] for c in s.board.cards if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
+        ids, waiting = select_tickets(p, s, a.ids)
         if not ids:
             raise SystemExit("No ready tickets.")
-        tickets, skipped = prepare(p, s, ids, a.force)
+        tickets, skipped = prepare(p, s, ids, a.force, waiting)
         for x in skipped:
             print(f"skipped {s.tracker.ref(x['id'])}: {x['error']}", file=sys.stderr)
         if not tickets:
@@ -1246,26 +1261,9 @@ def cmd_run(a) -> None:
                           "tickets": [t["ref"] for t in run.tickets]}))
         return
     import adapters
-    summary = runner.Loop(run, adapters.run_agent).execute()
+    summary = runner.Loop(run, adapters.run_agent,
+                          stack=lambda tid, onto, needs: stack_ticket(p, run, tid, onto, needs)).execute()
     print(json.dumps({"run": run.id, **summary}, indent=2))
-
-
-def commit_ticket(wt: Path, message: str, base: str = "") -> tuple[str, str]:
-    """Commit a ready ticket's staged change on its branch, locally: (commit, error).
-
-    A Python step makes this commit, not an agent, so a ticket waiting on this one can build on
-    it. Signing and commit hooks run as configured; push and the pull request wait for the ship
-    skill and the user's approval."""
-    if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode == 0:
-        # Already committed by an earlier handoff of this ticket (a resumed run): keep that commit.
-        if base and git(wt, "rev-list", "--count", f"{base}..HEAD", check=False).strip() not in ("", "0"):
-            return git(wt, "rev-parse", "HEAD").strip(), ""
-        return "", "nothing is staged"
-    out = subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", message], capture_output=True, text=True,
-                         stdin=subprocess.DEVNULL, timeout=300)
-    if out.returncode:
-        return "", (out.stderr or out.stdout).strip()[-500:] or f"exit {out.returncode}"
-    return git(wt, "rev-parse", "HEAD").strip(), ""
 
 
 def reline(p: Project, run, x: dict, below: dict) -> dict | None:
@@ -1346,7 +1344,7 @@ def stack_ticket(p: Project, run, tid: str, onto: str, needs: list[str]) -> dict
     commit past its base. When it needs finished tickets that are on separate branches, they are
     put in a line first, each on the one before (`reline`), and it goes on the top one. A branch
     that another ticket of the run builds on is never moved. A conflict or a failing check answers
-    `resolve`: the workflow runs that agent, then calls this again, which carries on."""
+    `resolve`: the caller runs that agent, then calls this again, which carries on."""
     def fail(reason: str) -> dict:
         return {"ok": False, "reason": reason, "base": "", "tree": "", "resolve": None}
 
@@ -1476,19 +1474,7 @@ def cmd_wf(a) -> None:
         s = snapshot(p)
         if not s.board.cards:
             raise SystemExit("\n".join(s.errors) or "The board has no tickets.")
-        ready = p.config["tracker"]["columns"]["ready"]
-        wanted = ([a.target] if a.target else []) + a.ids
-        ids = picked_ids(s, wanted) if wanted else [c["id"] for c in s.board.cards
-                                                    if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
-        waiting: dict[str, list[str]] = {}
-        if p.config["commitAtHandoff"]:
-            by, pool = s.by_id(), set(ids)
-            if not wanted:  # also blocked Ready-column tickets whose blockers all run now
-                pool |= {c["id"] for c in s.board.cards if c["status"] == ready}
-            for cid in sorted(pool):
-                if cid in by and (c := classify(p, s, by[cid]))["status"] == "blocked" and set(c["blockers"]) <= pool:
-                    waiting[cid] = c["blockers"]
-            ids = list(dict.fromkeys(ids + [cid for cid in waiting if cid not in ids]))
+        ids, waiting = select_tickets(p, s, ([a.target] if a.target else []) + a.ids)
         if not ids:
             raise SystemExit("No ready tickets.")
         tickets, skipped = prepare(p, s, ids, a.force, waiting)
@@ -1532,7 +1518,7 @@ def cmd_wf(a) -> None:
         t = next(x for x in run.tickets if x["id"] == a.id)
         res = {"status": data.get("status", "needs-human"), "why": data.get("why", ""), "preExisting": data.get("preExisting") or []}
         if res["status"] == "ready" and p.config["commitAtHandoff"]:
-            commit, error = commit_ticket(Path(t["worktree"]), (data.get("commitMessage") or "").strip() or t["name"], t["base"])
+            commit, error = runner.commit_ticket(t["worktree"], (data.get("commitMessage") or "").strip() or t["name"], t["base"])
             if error:
                 res.update(status="needs-human", why=f"the handoff commit failed: {error}")
             data["commit"] = commit

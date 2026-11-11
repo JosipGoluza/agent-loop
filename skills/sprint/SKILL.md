@@ -72,8 +72,11 @@ Report from `$AL status <run>` (or `--json`):
 
 - **Ready to ship:** ref, name, commit message, number of fix rounds.
 - **Needs you:** ref, and the exact question or blocker.
-- **Deferred:** ref and the reason (overlap with the files of a different ticket, or over
-  `maxParallel`). These tickets run in a later sprint.
+- **Deferred:** ref and the reason. These tickets run in a later sprint. With `commitAtHandoff`
+  on (the default), a ticket that overlaps the files of a different ticket, waits for one, or is
+  over `maxParallel` is not deferred: it waits in the same run and builds on the finished
+  ticket's commit. It is deferred only when the ticket it waits on did not finish ready. With
+  `commitAtHandoff` off, an overlap or a ticket over `maxParallel` is deferred.
 
 Then refer the user to the ship skill for the ready tickets.
 

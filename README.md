@@ -165,25 +165,27 @@ ticket for a later run and tells you why.
 
 ## Waiting tickets and stacked branches
 
-With `commitAtHandoff` on (the default) in a Claude Code Workflow run, a ticket that cannot start
-yet waits in the same run instead of stopping:
+With `commitAtHandoff` on (the default), a ticket that cannot start yet waits in the same run
+instead of stopping. This works the same in a Claude Code Workflow run and in `agentloop.py run`
+(Codex, Cursor, a terminal):
 
 - it overlaps a running ticket's files, or its tracker says another ticket of this run blocks it;
 - when that ticket is ready, a Python step has committed it on its branch (locally, not pushed);
-- `wf stack` moves the waiting ticket onto that commit, a planner plans it again on the new code,
-  and it starts. If it now overlaps another running ticket, it waits again and stacks on that one.
+- a stack step (`wf stack` in a Workflow run) moves the waiting ticket onto that commit, a planner
+  plans it again on the new code, and it starts. If it now overlaps another running ticket, it
+  waits again and stacks on that one.
 
 The result is a stack of branches, for example `#856 → #841 → #842`. The ship skill pushes them in
 order and opens each PR against the branch below it.
 
-When a ticket needs two tickets that are on separate branches, `wf stack` first puts one on top of
-the other, in its own worktree, then moves the waiting ticket onto the top one. A conflict or a
-failing check there goes to a resolve agent, and the ship skill runs the combine review on what that agent changed. A
-branch that another ticket of the run builds on is never moved.
+When a ticket needs two tickets that are on separate branches, the stack step first puts one on
+top of the other, in its own worktree, then moves the waiting ticket onto the top one. A conflict
+or a failing check there goes to a resolve agent, and the ship skill runs the combine review on
+what that agent changed. A branch that another ticket of the run builds on is never moved.
 
-A ticket stops as *needs you* when its blocker did not finish ready, or when its blockers cannot be
-put in a line. With `commitAtHandoff` off, the loop commits nothing, and an
-overlapping ticket waits for the next run.
+A waiting ticket is deferred to the next run when its blocker did not finish ready. It stops as
+*needs you* when its blockers cannot be put in a line. With `commitAtHandoff` off, the loop
+commits nothing, and an overlapping ticket waits for the next run.
 
 The commit at handoff is made by `agentloop.py`, not by an agent, with your git identity, signing
 and commit hooks. If a hook fails, the ticket needs you. Push and pull requests still wait for your
