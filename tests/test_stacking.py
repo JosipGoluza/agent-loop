@@ -102,6 +102,48 @@ class StackingTest(unittest.TestCase):
         again = checks("--since", first["tree"])
         self.assertEqual((again["outOfPlan"], again["scopeFiles"]), (["extra.py", "new.py"], ["new.py"]))
 
+    def add_tickets(self, *more, **cfg):
+        path = self.state / "tickets.json"
+        path.write_text(json.dumps(json.loads(path.read_text()) + list(more)))
+        if cfg:
+            config = self.state / "config.json"
+            config.write_text(json.dumps({**json.loads(config.read_text()), **cfg}))
+
+    def skipped(self):
+        return {x["id"]: x["error"] for x in json.loads((self.run_dir / "run.json").read_text())["skipped"]}
+
+    def test_a_ticket_whose_blocker_is_skipped_stays_out_of_the_run(self):
+        """#5 is blocked by #4, which no run makes, so it is skipped. #6 waits for #5: without #5
+        in the run nothing would hold #6 back, so it is skipped too."""
+        self.add_tickets({"id": 4, "name": "Four", "status": "Doing"},
+                         {"id": 5, "name": "Five", "status": "Todo", "blockers": [4]},
+                         {"id": 6, "name": "Six", "status": "Todo", "blockers": [5]})
+        p = al.require_project()
+        ids, waiting = al.select_tickets(p, al.snapshot(p), [])   # a sprint: neither joins
+        self.assertEqual((ids, waiting), (["1", "3", "2"], {"2": ["1"]}))
+        args = self.start("1", "6", "5")                          # asked for by id: both are skipped, with the reason
+        self.assertEqual([t["id"] for t in args["tickets"]], ["1"])
+        self.assertEqual(self.skipped(), {"6": "waiting on #5; #5 is not in this run (waiting on #4)", "5": "waiting on #4"})
+        self.assertFalse(self.worktree("6").exists())
+
+    def test_a_ticket_whose_blockers_setup_fails_is_skipped_with_it(self):
+        self.add_tickets({"id": 7, "name": "Seven", "status": "Todo", "blockers": [2]},
+                         setup=["case {worktree} in */1) echo no deps; exit 1;; esac"])
+        args = self.start()
+        self.assertEqual([t["id"] for t in args["tickets"]], ["3"])
+        skipped = self.skipped()
+        self.assertIn("setup failed", skipped["1"])
+        self.assertTrue(skipped["2"].startswith("waiting on #1; #1 is not in this run (setup failed"), skipped["2"])
+        self.assertTrue(skipped["7"].startswith("waiting on #2; #2 is not in this run (waiting on #1"), skipped["7"])
+        self.assertFalse(self.worktree("7").exists())
+
+    def test_a_chain_of_waiting_tickets_joins_the_run(self):
+        self.add_tickets({"id": 7, "name": "Seven", "status": "Todo", "blockers": [2]})
+        by = {t["id"]: t for t in self.start("7", "2", "1")["tickets"]}
+        self.assertEqual(list(by), ["7", "2", "1"])                # the order that was asked for
+        self.assertEqual((by["7"]["waitFor"], by["2"]["waitFor"]), (["2"], ["1"]))
+        self.assertEqual(self.skipped(), {})
+
     def test_the_handoff_commits_a_ready_ticket(self):
         self.start("1")
         out = self.finish_ready("1")
@@ -270,6 +312,15 @@ class WithoutCommitsTest(StackingTest):
     def test_a_ticket_blocked_by_one_in_the_run_waits_for_it(self):
         args = self.start()
         self.assertEqual(sorted(t["id"] for t in args["tickets"]), ["1", "3"])
+
+    def test_a_ticket_whose_blocker_is_skipped_stays_out_of_the_run(self):
+        pass  # no ticket waits in a run
+
+    def test_a_ticket_whose_blockers_setup_fails_is_skipped_with_it(self):
+        pass
+
+    def test_a_chain_of_waiting_tickets_joins_the_run(self):
+        pass
 
     def test_the_handoff_commits_a_ready_ticket(self):
         self.start("1")

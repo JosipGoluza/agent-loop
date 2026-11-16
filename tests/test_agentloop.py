@@ -262,6 +262,90 @@ class TrelloBareLayoutTest(Base):
         self.assertEqual(c["pr"]["template"], ".github/PULL_REQUEST_TEMPLATE.md")
 
 
+def pr(number, ticket, base="main"):
+    return {"number": number, "title": f"Ticket {ticket}", "headRefName": f"feat/{ticket}-t{ticket}", "baseRefName": base,
+            "isDraft": False, "reviewDecision": "", "url": "u"}
+
+
+class StackTopTest(Base):
+    """A ticket whose blockers have open pull requests starts on the top of their stack."""
+
+    TICKETS = [{"id": n, "name": f"T{n}", "status": "Review"} for n in (1, 2, 3, 4)] + [
+        {"id": 10, "name": "On one", "status": "Todo", "blockers": [1]},
+        {"id": 11, "name": "On two", "status": "Todo", "blockers": [1, 2]},
+        {"id": 12, "name": "On two stacks", "status": "Todo", "blockers": [2, 4]},
+        {"id": 13, "name": "One has no branch", "status": "Todo", "blockers": [1, 5]},
+        {"id": 5, "name": "Not started", "status": "Todo"},
+    ]
+    # main <- #1 <- #2 <- #3, and main <- #4
+    PRS = [pr(51, 1), pr(52, 2, "feat/1-t1"), pr(53, 3, "feat/2-t2"), pr(54, 4)]
+
+    def fake_gh(self, *args):
+        if args[:2] == ("pr", "list"):
+            return self.prs if "open" in args else []
+        return super().fake_gh(*args)
+
+    def setUp(self):
+        super().setUp()
+        self.prs = list(self.PRS)
+        self.clone = self.tmp / "app"
+        sh("git", "clone", "-q", str(self.origin), str(self.clone))
+        os.chdir(self.clone)
+        state = self.clone / ".git" / "agent-loop"
+        state.mkdir()
+        cfg = al.merged(al.DEFAULT_CONFIG, {"repo": "o/app", "setup": [], "tracker": {
+            "type": "file", "columns": {"ready": "Todo"}, "show": ["Todo", "Review"], "done": ["Done"]}})
+        (state / "config.json").write_text(json.dumps(cfg))
+        (state / "tickets.json").write_text(json.dumps(self.TICKETS))
+
+    def tickets(self):
+        return {t["id"]: t for t in json.loads(self.run_cli("tickets", "--all"))}
+
+    def test_a_pull_request_above_the_blocker_is_the_base(self):
+        got = self.tickets()["10"]
+        self.assertEqual((got["status"], got["base"]), ("ready", "origin/feat/3-t3"))
+        self.assertEqual(got["reason"], "stacked on #1 (PR #51), at the top of that stack (PR #53)")
+        self.prs = self.PRS[:1]   # nothing above #1: its own branch, as before
+        got = self.tickets()["10"]
+        self.assertEqual((got["base"], got["reason"]), ("origin/feat/1-t1", "stacked on #1 (PR #51)"))
+
+    def test_two_blockers_on_one_stack_give_its_top(self):
+        got = self.tickets()["11"]
+        self.assertEqual((got["status"], got["base"]), ("ready", "origin/feat/3-t3"))
+        self.assertEqual(got["reason"], "stacked on #1 (PR #51), #2 (PR #52), at the top of that stack (PR #53)")
+        self.prs = self.PRS[:2]   # the upper blocker is the top
+        got = self.tickets()["11"]
+        self.assertEqual((got["base"], got["reason"]), ("origin/feat/2-t2", "stacked on #1 (PR #51), #2 (PR #52)"))
+
+    def test_two_blockers_on_two_stacks_stay_blocked(self):
+        got = self.tickets()["12"]
+        self.assertEqual((got["status"], got["base"], got["blockers"]), ("blocked", "origin/main", ["2", "4"]))
+        self.assertEqual(got["reason"], "waiting on #2 (PR #52), #4 (PR #54): they are on separate stacks, "
+                                        "`feat/3-t3` (PR #53) and `feat/4-t4` (PR #54)")
+        # two pull requests onto the same branch are two stacks too
+        self.prs = [pr(51, 1), pr(52, 2, "feat/1-t1"), pr(54, 4, "feat/1-t1")]
+        self.assertIn("separate stacks, `feat/2-t2` (PR #52) and `feat/4-t4` (PR #54)", self.tickets()["12"]["reason"])
+
+    def test_a_blocker_with_no_branch_still_blocks(self):
+        got = self.tickets()["13"]
+        self.assertEqual((got["status"], got["reason"], got["base"]), ("blocked", "waiting on #5", "origin/main"))
+        self.assertEqual([t["id"] for t in json.loads(self.run_cli("tickets"))], ["10", "11", "5"])
+
+    def test_a_run_waits_for_the_blocker_it_prepares_and_starts_on_the_others_stack(self):
+        """#13 needs #1 (a pull request, with two more above it) and #5 (made in this run)."""
+        sh("git", "-C", str(self.clone), "push", "-q", "origin", "origin/main:refs/heads/feat/3-t3")
+        p = al.require_project()
+        s = al.snapshot(p)
+        ids, waiting = al.select_tickets(p, s, [])
+        self.assertEqual((ids, waiting), (["10", "11", "5", "13"], {"13": ["5"]}))
+        tickets, skipped = al.prepare(p, s, ids, waiting=waiting)
+        by = {t["id"]: t for t in tickets}
+        self.assertEqual(skipped, [])
+        self.assertEqual((by["13"]["waitFor"], by["13"]["base"]), (["5"], "origin/feat/3-t3"))
+        self.assertEqual(by["13"]["reason"], "stacked on #1 (PR #51), at the top of that stack (PR #53); waits for #5")
+        self.assertNotIn("waitFor", by["5"])
+
+
 ISSUES = [  # a GitHub project's items, as `gh project item-list --format json` prints them
     {"id": "I1", "status": "Todo", "labels": ["bug"], "content": {"type": "Issue", "number": 11, "title": "Fix login", "url": "https://github.com/o/app/issues/11", "body": "Broken.", "repository": "o/app"}},
     {"id": "I2", "status": "Todo", "content": {"type": "Issue", "number": 12, "title": "Add export", "url": "https://github.com/o/app/issues/12", "body": "Blocked by #11", "repository": "o/app"}},
