@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_stacking import StackingTest, git  # noqa: E402
+from test_stacking import Repo, git  # noqa: E402  (Repo has no tests: importing it does not run test_stacking twice)
 
 import agentloop as al  # noqa: E402
 import stacking  # noqa: E402
@@ -37,12 +37,12 @@ class Agent:
 
 
 class ShipStackTest(unittest.TestCase):
-    setUp_ = StackingTest.setUp
-    tearDown = StackingTest.tearDown
-    cli = StackingTest.cli
-    start = StackingTest.start
-    worktree = StackingTest.worktree
-    finish_ready = StackingTest.finish_ready
+    setUp_ = Repo.setUp
+    tearDown = Repo.tearDown
+    cli = Repo.cli
+    start = Repo.start
+    worktree = Repo.worktree
+    finish_ready = Repo.finish_ready
 
     def setUp(self):
         self.setUp_()
@@ -123,7 +123,7 @@ class ShipStackTest(unittest.TestCase):
 
     def test_staged_tickets_are_committed_with_their_message(self):
         self.tearDown()
-        StackingTest.setUp(self, commits=False)
+        Repo.setUp(self, commits=False)
         self.configure(stack="sprint")
         self.start()
         self.finish_ready("1")
@@ -134,7 +134,7 @@ class ShipStackTest(unittest.TestCase):
 
     def test_a_ticket_with_nothing_to_ship_stops_its_stack(self):
         self.tearDown()
-        StackingTest.setUp(self, commits=False)
+        Repo.setUp(self, commits=False)
         self.configure(stack="sprint")
         self.start("1", "3")
         self.finish_ready("1")

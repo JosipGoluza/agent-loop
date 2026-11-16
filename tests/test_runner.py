@@ -242,7 +242,7 @@ class RunCommandTest(unittest.TestCase):
         self.assertEqual([r["ref"] for r in summary["ready"]], ["#1"])          # #7 is blocked by #9, not run
         self.assertEqual(summary["needsHuman"][0]["ref"], "#6")
         self.assertTrue((self.tmp / "app-worktrees" / "1" / "a.py").is_file())
-        self.assertTrue((self.clone / ".git" / "agent-loop" / "handoffs" / "1.md").is_file())
+        self.assertNotIn("commit", al.read_handoff(self.clone / ".git" / "agent-loop" / "handoffs" / "1.md"))  # commitAtHandoff off
         status = io.StringIO()
         with redirect_stdout(status):
             al.main(["status"])
@@ -354,36 +354,34 @@ class StackingRunTest(unittest.TestCase):
     def note(self, tid):
         return al.read_handoff(self.state / "handoffs" / f"{tid}.md")
 
-    def contains(self, branch, other):
-        return subprocess.run(["git", "-C", str(self.clone), "merge-base", "--is-ancestor", other, branch]).returncode == 0
-
     def test_waiting_tickets_build_on_the_finished_ones_commit(self):
-        """#2 waits for #1 by the tracker, #3 because it overlaps #1's files."""
+        """#2 waits for #1 by the tracker, #3 because it overlaps #1's files. #5 waits for #4,
+        whose handoff commit a hook refuses."""
+        self.configure(self.TICKETS + [{"id": 4, "name": "Four", "status": "Todo"},
+                                       {"id": 5, "name": "Five", "status": "Todo", "blockers": [4]}])
+        hook = Path(git("-C", str(self.clone), "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks" / "commit-msg"
+        hook.write_text("#!/bin/sh\nif grep -q 'ticket 4' \"$1\"; then echo 'lint says no' >&2; exit 1; fi\n")
+        hook.chmod(0o755)
         fake = GitAdapter(files={"1": ["a.py"], "3": ["a.py"]})
         summary = self.run_cli(fake)
         self.assertEqual({r["ref"]: r["base"] for r in summary["ready"]},
                          {"#1": "origin/main", "#2": "feat/1-one", "#3": "feat/1-one"})
-        self.assertEqual(summary["deferred"], [])
+        self.assertEqual([(n["ref"], n["question"]) for n in summary["needsHuman"]], [("#4", "the handoff commit failed: lint says no")])
+        self.assertEqual(self.note("4")["status"], "needs-human")
+        self.assertEqual(summary["deferred"], [{"id": "5", "ref": "#5", "reason": "waits on #4, which did not finish ready"}])
+        self.assertNotIn("5", {tid for tid, _ in fake.calls})      # a ticket the tracker holds back is not planned on the trunk
+        self.assertNotIn(("2", "plan"), fake.calls)
+        self.assertIn(("3", "plan"), fake.calls)                   # an overlap is only found by planning
         for tid, branch in (("2", "feat/2-two"), ("3", "feat/3-three")):
             self.assertEqual(self.rev(branch + "^"), self.rev("feat/1-one"))
             self.assertIn("t1.py", fake.saw[tid])                   # it was built on #1's code
-            self.assertIn((tid, "plan2"), fake.calls)               # and planned again there
+            self.assertIn((tid, "plan2"), fake.calls)               # and planned there
             self.assertLess(fake.calls.index(("1", "handoff")), fake.calls.index((tid, "implement")))
             note = self.note(tid)
             self.assertEqual((note["status"], note["base"], note["commit"]), ("ready", "feat/1-one", self.rev(branch)))
         self.assertEqual(git("-C", str(self.clone), "log", "-1", "--format=%s", "feat/3-three"), "feat: ticket 3")
         state = json.loads((self.state / "runs" / summary["run"] / "run.json").read_text())
         self.assertEqual(state["tickets"]["3"]["commit"], self.rev("feat/3-three"))
-
-    def test_a_blocker_whose_commit_fails_needs_a_human_and_its_waiter_is_deferred(self):
-        hook = Path(git("-C", str(self.clone), "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks" / "pre-commit"
-        hook.write_text("#!/bin/sh\necho 'lint says no' >&2\nexit 1\n")
-        hook.chmod(0o755)
-        summary = self.run_cli(GitAdapter(), "1", "2")
-        self.assertEqual(summary["ready"], [])
-        self.assertIn("the handoff commit failed: lint says no", summary["needsHuman"][0]["question"])
-        self.assertEqual(self.note("1")["status"], "needs-human")
-        self.assertEqual(summary["deferred"][0]["reason"], "waits on #1, which did not finish ready")
 
     def test_two_blockers_are_put_in_a_line_and_a_conflict_goes_to_a_resolve_agent(self):
         self.configure([{"id": 1, "name": "One", "status": "Todo"}, {"id": 3, "name": "Three", "status": "Todo"},
@@ -418,23 +416,12 @@ class StackingRunTest(unittest.TestCase):
         self.assertEqual(self.rev("feat/1-one"), one)               # #1 keeps its commit
         self.assertEqual(self.rev("feat/2-two^"), one)
         self.assertEqual([c for c in fake.calls if c[0] == "1"], [])
-        self.assertEqual([label for tid, label in fake.calls if tid == "2"][0], "implement")  # both plans were kept
+        self.assertEqual([label for tid, label in fake.calls if tid == "2"][0], "implement")  # its plan was kept
         # a second resume, of a finished run, calls no agent and changes no branch
         two = self.rev("feat/2-two")
         again = self.run_cli(GitAdapter(stop=("x", "x")), "--resume", run_id)
         self.assertEqual(again["ready"], summary["ready"])
         self.assertEqual((self.rev("feat/1-one"), self.rev("feat/2-two")), (one, two))
-
-    def test_without_the_handoff_commit_overlaps_are_deferred(self):
-        self.configure(commitAtHandoff=False)
-        fake = GitAdapter(files={"1": ["a.py"], "3": ["a.py"]})
-        summary = self.run_cli(fake)
-        self.assertEqual([r["ref"] for r in summary["ready"]], ["#1"])            # #2 is blocked: not in the run
-        self.assertEqual(summary["deferred"], [{"id": "3", "ref": "#3", "reason": "overlaps #1 on a.py"}])
-        self.assertEqual({tid for tid, _ in fake.calls}, {"1", "3"})
-        self.assertEqual(self.rev("feat/1-one"), self.rev("origin/main"))         # nothing committed
-        self.assertNotIn("commit", self.note("1"))
-        self.assertIn("t1.py", git("-C", str(self.tmp / "app-worktrees" / "1"), "diff", "--cached", "--name-only"))
 
 
 if __name__ == "__main__":

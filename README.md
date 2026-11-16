@@ -174,8 +174,12 @@ instead of stopping. This works the same in a Claude Code Workflow run and in `a
 - it overlaps a running ticket's files, or its tracker says another ticket of this run blocks it;
 - when that ticket is ready, a Python step has committed it on its branch (locally, not pushed);
 - a stack step (`wf stack` in a Workflow run) moves the waiting ticket onto that commit, a planner
-  plans it again on the new code, and it starts. If it now overlaps another running ticket, it
-  waits again and stacks on that one.
+  plans it on the new code, and it starts. If it now overlaps another running ticket, it waits
+  again and stacks on that one.
+
+A ticket its tracker says waits is not planned before that: a plan made on the trunk, without the
+code it builds on, would be thrown away. A ticket that waits because of an overlap was planned
+first, since its plan's file list is how the overlap is found.
 
 The result is a stack of branches, for example `#856 → #841 → #842`. The ship skill pushes them in
 order and opens each PR against the branch below it.
