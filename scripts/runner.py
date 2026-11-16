@@ -617,7 +617,7 @@ class Loop:
     # --- stacking: a waiting ticket moves onto the finished ones it waits on -------
 
     def restack(self, t: dict, on: set, order: list[str], n: int) -> tuple[dict, dict | None, str]:
-        """Move waiting ticket `t` onto the finished tickets `on` and plan it again there:
+        """Move waiting ticket `t` onto the finished tickets `on` and plan it there:
         (ticket, plan, why it needs a human). `n` counts the ticket's moves in this run. The stack
         step leaves alone a ticket that a stopped run already moved, so a resume is safe."""
         by = {x["id"]: x for x in self.run.tickets}
@@ -646,8 +646,8 @@ class Loop:
             return t, None, f"cannot build on {by[onto]['ref']}: {why}"
         t = next((x for x in self.run.tickets if x["id"] == t["id"]), t)
         t["base"] = moved["base"]
-        self.run.log(f"{t['ref']}: moved onto {by[onto]['ref']} ({t['base']}); planning again on the new code")
-        plan = self.plan(t, f"plan{n + 1}")  # a new label: the first plan was made on the old base
+        self.run.log(f"{t['ref']}: moved onto {by[onto]['ref']} ({t['base']}); planning it on the new code")
+        plan = self.plan(t, f"plan{n + 1}")  # a new label per move: any earlier plan was made on another base
         if not plan or not plan["feasible"]:
             return t, None, (plan.get("question") or plan["summary"]) if plan else "the planner failed"
         return t, plan, ""
@@ -660,13 +660,16 @@ class Loop:
         self.run.log(f"run {self.run.id}: {len(tickets)} ticket(s), tools " +
                      ", ".join(f"{s}={self.run.tool(s)}" for s in STAGES))
 
+        refs = {t["id"]: t["ref"] for t in tickets}
+        # A ticket that waits for others of this run is planned once, after it is moved onto their
+        # code: a plan made before that code exists is thrown away, and a false "infeasible" would stop it.
+        blockers_of = lambda t: {i for i in t.get("waitFor") or [] if i in refs} if self.stacking else set()  # noqa: E731
         with ThreadPoolExecutor(self.parallel) as pool:
-            plans = list(pool.map(self.plan, tickets))
+            plans = list(pool.map(lambda t: None if blockers_of(t) else self.plan(t), tickets))
 
         batch, deferred, needs_human, taken = [], [], [], {}
         later = []  # {t, plan, on}: tickets that wait for others of this run (when it stacks)
         exclusive = self.p.get("exclusive") or []
-        refs = {t["id"]: t["ref"] for t in tickets}
         names = lambda ids: ", ".join(refs.get(i, f"#{i}") for i in sorted(ids))  # noqa: E731
         place = lambda claim: claim.split(":", 1)[1]  # noqa: E731
 
@@ -685,18 +688,18 @@ class Loop:
             self.run.log(f"{t['ref']}: {why}")
 
         for t, plan in zip(tickets, plans):
+            if blockers_of(t):
+                hold(t, None, blockers_of(t))  # restack plans it
+                continue
             if not plan:
                 defer(t, "planner failed; run it again")
                 continue
             if not plan["feasible"]:
                 human(t, plan.get("question") or plan["summary"])
                 continue
-            blockers = {i for i in t.get("waitFor") or [] if i in refs}
             mine = claims(plan, exclusive)
             clashes = [c for c in sorted(mine) if c in taken]
-            if self.stacking and blockers:
-                hold(t, plan, blockers)
-            elif clashes and self.stacking:
+            if clashes and self.stacking:
                 hold(t, plan, {taken[c]["id"] for c in clashes})
             elif clashes:
                 defer(t, f"overlaps {taken[clashes[0]]['ref']} on {place(clashes[0])}")
@@ -725,7 +728,7 @@ class Loop:
             return summary
 
         # Tickets run with no barrier between them. Each time one finishes, the tickets that waited
-        # for it wake: moved onto its commit, planned again on the new code, and started unless they
+        # for it wake: moved onto its commit, planned on the new code, and started unless they
         # now overlap another running ticket.
         results = {n["id"]: {"status": "needs-human"} for n in needs_human}  # id -> the finished ticket's result
         results.update({d["id"]: {"status": "deferred"} for d in deferred})

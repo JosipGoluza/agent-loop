@@ -129,8 +129,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(out["result"]["needsHuman"][0]["ref"], "#3")      # 2 of 3 confirmed: it blocks
 
     def test_waiting_tickets_stack_on_their_blocker_and_chain(self):
-        out = self.run_workflow(args(["1", "2", "7"], commitAtHandoff=True))
+        a = args(["1", "2", "7"], commitAtHandoff=True)
+        a["tickets"][1]["waitFor"] = ["1"]                                          # #2 by its tracker, #7 by overlap
+        out = self.run_workflow(a)
         r, calls = out["result"], out["calls"]
+        self.assertNotIn("plan:#2", calls)                                         # planned only on #1's code
+        self.assertIn("plan:#7", calls)                                            # an overlap is only found by planning
         self.assertEqual(sorted(x["ref"] for x in r["ready"]), ["#1", "#2", "#7"])
         bases = {x["ref"]: x["base"] for x in r["ready"]}
         self.assertEqual(bases, {"#1": "origin/main", "#2": "feat/1", "#7": "feat/2"})  # #7 waited twice: on #1, then on #2
