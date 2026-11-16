@@ -153,8 +153,10 @@ A ticket in the Ready column is **ready** when these conditions are true:
 - It has no worktree with work in it and no open pull request.
 - All its blockers are done, closed, archived or merged.
 
-If one blocker has an open pull request, the ticket can start on the branch of that pull
-request.
+If every open blocker has an open pull request, and those pull requests are in one stack, the
+ticket starts on the top branch of that stack. So it also has the pull requests that are stacked
+above its blockers. A blocker with no pull request blocks the ticket. Blockers in two separate
+stacks block it too, and the reason names the top branch of each stack.
 
 agent-loop reads the blockers from Jira links and GitHub issue dependencies. On other trackers,
 it reads `#123` references below a `Blockers` heading, or after "Blocked by" or "Depends on".
@@ -182,6 +184,10 @@ When a ticket needs two tickets that are on separate branches, the stack step fi
 top of the other, in its own worktree, then moves the waiting ticket onto the top one. A conflict
 or a failing check there goes to a resolve agent, and the ship skill runs the combine review on
 what that agent changed. A branch that another ticket of the run builds on is never moved.
+
+A ticket waits in a run only when each of its blockers is prepared in that run or has a pull
+request in the one stack it starts on. When a blocker is skipped (it is blocked itself, or its
+setup failed), the ticket is skipped too, and the reason names that blocker.
 
 A waiting ticket is deferred to the next run when its blocker did not finish ready. It stops as
 *needs you* when its blockers cannot be put in a line. With `commitAtHandoff` off, the loop

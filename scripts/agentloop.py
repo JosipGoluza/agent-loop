@@ -654,8 +654,27 @@ def worktree_base(p: Project, s: Snapshot, card: dict, branch: str, path: str) -
     return stacking.sits_on(path, branches, p.config["base"], noted=h.get("base", ""), own=h.get("commit", ""))
 
 
-def classify(p: Project, s: Snapshot, card: dict) -> dict:
-    """One ticket object: what it is, whether an agent may start it, and on which base."""
+def stack_top(p: Project, s: Snapshot, blockers: list[str]) -> tuple[dict | None, list[dict]]:
+    """The top pull request of the one open stack that holds the pull requests of all `blockers`
+    (each has one). A ticket that needs them starts there, not on a blocker's own branch: a pull
+    request stacked above a blocker is part of what it builds on, and its own goes on top.
+
+    (None, the top of each stack) when the blockers are on separate stacks."""
+    import stacking
+    trunk = stacking.trunk_of(p.config["base"])
+    prs = [s.pr_for(b) for b in blockers]
+    chains = [stacking.chain_of(s.open_prs, pr, trunk) for pr in prs]
+    for chain in chains:
+        if {pr["number"] for pr in prs} <= {x["number"] for x in chain}:
+            return chain[-1], []
+    return None, list({c[-1]["number"]: c[-1] for c in chains}.values())
+
+
+def classify(p: Project, s: Snapshot, card: dict, running: set[str] | frozenset[str] = frozenset()) -> dict:
+    """One ticket object: what it is, whether an agent may start it, and on which base.
+
+    `running` are the tickets a run has prepared. A blocker among them needs no pull request: the
+    ticket waits for it in that run (`waitFor`) and is moved onto its commit then."""
     tcfg = p.config["tracker"]
     cards = s.by_id()
     done = set(tcfg["done"])
@@ -674,6 +693,7 @@ def classify(p: Project, s: Snapshot, card: dict) -> dict:
         open_blockers.append(b)
 
     base, status, reason = p.config["base"], "ready", ""
+    waiting_for: list[str] = []
     wt, pr = s.worktree_for(cid), s.pr_for(cid)
     ref = s.tracker.ref
     # Started work keeps the base it really has: a second run of a stacked ticket must not see the
@@ -687,11 +707,26 @@ def classify(p: Project, s: Snapshot, card: dict) -> dict:
     elif wt and worktree_in_use(p, cid, wt[1], base):
         status, reason = "in-flight", f"worktree {wt[1]}"
     elif open_blockers:
-        stack = [s.pr_for(b) for b in open_blockers]
-        if len(open_blockers) == 1 and stack[0]:
-            base, reason = f"origin/{stack[0]['headRefName']}", f"stacked on {ref(open_blockers[0])} (PR #{stack[0]['number']})"
-        else:
-            status, reason = "blocked", "waiting on " + ", ".join(ref(b) for b in open_blockers)
+        waits = [b for b in open_blockers if b in running]
+        built = [b for b in open_blockers if b not in running]
+        missing = [b for b in built if not s.pr_for(b)]
+        if missing:  # no branch to build on, and it is not made in this run
+            status, reason = "blocked", "waiting on " + ", ".join(ref(b) for b in missing)
+        elif built:
+            numbers = {b: s.pr_for(b)["number"] for b in built}
+            named = ", ".join(f"{ref(b)} (PR #{n})" for b, n in numbers.items())
+            top, tops = stack_top(p, s, built)
+            if top:
+                base, reason = f"origin/{top['headRefName']}", f"stacked on {named}"
+                if top["number"] not in numbers.values():
+                    reason += f", at the top of that stack (PR #{top['number']})"
+            else:
+                status, reason = "blocked", (f"waiting on {named}: they are on separate stacks, "
+                                             + " and ".join(f"`{x['headRefName']}` (PR #{x['number']})" for x in tops))
+        if waits:
+            waiting_for = waits
+            if status != "blocked":
+                reason = "; ".join(x for x in (reason, "waits for " + ", ".join(ref(b) for b in waits)) if x)
 
     branch = wt[0] if wt else p.config["branch"].format(type=kind, slug=slug_of(card), id=cid)
     return {
@@ -708,6 +743,7 @@ def classify(p: Project, s: Snapshot, card: dict) -> dict:
         "branch": branch,
         "base": base,
         "worktree": wt[1] if wt else str(p.worktree(cid)),
+        **({"waitFor": waiting_for} if waiting_for else {}),
     }
 
 
@@ -1173,22 +1209,40 @@ def prepare(p: Project, s: Snapshot, ids: list[str], force: bool = False,
             waiting: dict[str, list[str]] | None = None) -> tuple[list[dict], list[dict]]:
     """Create or reuse each ticket's worktree and run setup; returns (prepared tickets, skipped ones).
 
-    `waiting` maps a blocked ticket to the tickets of this same run it waits for: it is prepared
-    like a ready one and carries `waitFor`, so the run can start it once those are done."""
+    `waiting` maps a ticket to the tickets of this same run it waits for: it is prepared like a
+    ready one and carries `waitFor`, so the run can start it once those are done. That holds only
+    for the blockers that really are prepared here. A ticket stays out of the run unless each of
+    its blockers is prepared in it or has a pull request on the one stack the ticket starts on:
+    without its blocker in the run, nothing would hold it back from starting on the trunk."""
     waiting = waiting or {}
-    by = s.by_id()
+    by, ref = s.by_id(), s.tracker.ref
+    ids = list(dict.fromkeys(ids))
     git(p.root, "fetch", "-q", "origin")
-    tickets, skipped = [], []
+    order: list[str] = []  # a ticket comes after its blockers: whether they were prepared decides if it runs
+    seen: set[str] = set()
+
+    def visit(cid: str) -> None:
+        if cid in seen:
+            return
+        seen.add(cid)
+        for b in (by.get(cid) or {}).get("blockers", []):
+            if b in ids:
+                visit(b)
+        order.append(cid)
+
     for cid in ids:
+        visit(cid)
+    done: dict[str, dict] = {}     # id -> the prepared ticket
+    out: dict[str, dict] = {}      # id -> the skipped one, with `error`
+    for cid in order:
         if cid not in by:
-            skipped.append({"id": cid, "error": "not on the board"})
+            out[cid] = {"id": cid, "error": "not on the board"}
             continue
-        t = classify(p, s, by[cid])
+        t = classify(p, s, by[cid], {b for b in waiting.get(cid, []) if b in done})
         wt = Path(t["worktree"])
-        if t["status"] == "blocked" and cid in waiting:
-            t["waitFor"] = waiting[cid]
-        elif t["status"] == "blocked" and not force:
-            skipped.append({**t, "error": t["reason"]})
+        if t["status"] == "blocked" and not force:
+            gone = [f"{ref(b)} is not in this run ({out[b]['error'].split('; ')[0]})" for b in t["blockers"] if b in out]
+            out[cid] = {**t, "error": "; ".join([t["reason"], *gone])}
             continue
         if not wt.exists():
             wt.parent.mkdir(parents=True, exist_ok=True)
@@ -1201,10 +1255,10 @@ def prepare(p: Project, s: Snapshot, ids: list[str], force: bool = False,
         t["setup"] = run_setup(p, wt)
         failed = [x for x in t["setup"] if not x["ok"]]
         if failed:
-            skipped.append({**t, "error": f"setup failed: {failed[0]['cmd']}: {failed[0]['tail']}"})
+            out[cid] = {**t, "error": f"setup failed: {failed[0]['cmd']}: {failed[0]['tail']}"}
         else:
-            tickets.append(t)
-    return tickets, skipped
+            done[cid] = t
+    return [done[cid] for cid in ids if cid in done], [out[cid] for cid in ids if cid in out]
 
 
 def run_project(p: Project) -> dict:
@@ -1228,20 +1282,33 @@ def runs_dir(p: Project) -> Path:
 
 def select_tickets(p: Project, s: Snapshot, wanted: list[str]) -> tuple[list[str], dict[str, list[str]]]:
     """The tickets of a new run: (ids, waiting). Without `wanted`, every ready ticket of the Ready
-    column. When the project commits at handoff, also the blocked ones whose blockers all run in
-    this run: `waiting` maps each of them to those blockers, and it starts when they are done."""
+    column. When the project commits at handoff, also the tickets with a blocker that runs in this
+    run: `waiting` maps each of them to those blockers, and it starts when they are done. Each
+    other blocker of such a ticket must have a pull request, all on one stack (`classify`).
+
+    A ticket runs here only if it is ready, or was asked for and is not blocked, or waits for
+    tickets that run here. So a blocked ticket never counts as a running blocker: `prepare` would
+    skip it, and the ticket that waits for it would start without it."""
     ready = p.config["tracker"]["columns"]["ready"]
-    ids = picked_ids(s, wanted) if wanted else [c["id"] for c in s.board.cards
-                                                if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
+    by = s.by_id()
+    ids = list(dict.fromkeys(picked_ids(s, wanted))) if wanted else [
+        c["id"] for c in s.board.cards if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
     waiting: dict[str, list[str]] = {}
     if p.config["commitAtHandoff"]:
-        by, pool = s.by_id(), set(ids)
-        if not wanted:  # also blocked Ready-column tickets whose blockers all run now
-            pool |= {c["id"] for c in s.board.cards if c["status"] == ready}
-        for cid in sorted(pool):
-            if cid in by and (c := classify(p, s, by[cid]))["status"] == "blocked" and set(c["blockers"]) <= pool:
-                waiting[cid] = c["blockers"]
-        ids = list(dict.fromkeys(ids + [cid for cid in waiting if cid not in ids]))
+        pool = [cid for cid in ids if cid in by] if wanted else [c["id"] for c in s.board.cards if c["status"] == ready]
+        runs = {cid for cid in ids if cid in by and classify(p, s, by[cid])["status"] != "blocked"}
+        more = True
+        while more:  # a ticket that joins lets the tickets it blocks join in turn
+            more = False
+            for cid in pool:
+                if cid in runs:
+                    continue
+                c = classify(p, s, by[cid], runs)
+                if c["status"] != "blocked" and c.get("waitFor"):
+                    waiting[cid] = c["waitFor"]
+                    runs.add(cid)
+                    more = True
+        ids = list(dict.fromkeys(ids + [cid for cid in pool if cid in waiting]))
     return ids, waiting
 
 
