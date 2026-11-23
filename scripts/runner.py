@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import subprocess
+import tempfile
 import threading
 import sys
 import time
@@ -62,12 +64,44 @@ DEFAULT_LENSES = ("spec", "correctness", "standards")
 SEVERITY = {"blocker": 0, "major": 1, "minor": 2}
 
 
+SANDBOX_CACHE = "cursor-sandbox-cache"
+
+
+def writable(directory: Path) -> bool:
+    """Whether a file can really be created in `directory` (made if missing). A sandbox can deny the
+    write even when access(2) says yes, so this tries it."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=directory):
+            return True
+    except OSError:
+        return False
+
+
+def check_env(env: dict | None = None) -> dict:
+    """The environment a check runs with. Cursor's sandbox points UV_CACHE_DIR at a private copy under
+    cursor-sandbox-cache, and the variable outlives the sandbox: a command allowed out of it still
+    inherits it, and that copy can hold metadata uv cannot read (uvx then fails with no output). Drop
+    it then, so uv uses its default cache, but only when that cache is writable from here: inside the
+    sandbox it is not, and unsetting would only trade the problem for a permission error. A cache
+    path set anywhere else (by a person or CI) is kept."""
+    env = dict(os.environ if env is None else env)
+    cache = env.get("UV_CACHE_DIR", "")
+    if SANDBOX_CACHE in Path(cache).parts:
+        base = Path(env["XDG_CACHE_HOME"]) if env.get("XDG_CACHE_HOME") else Path.home() / ".cache"
+        if writable(base / "uv"):
+            del env["UV_CACHE_DIR"]
+    return env
+
+
 def run_checks(worktree: str, checks: list[str], timeout: int = 900) -> list[dict]:
     """Run the configured checks in the worktree: objective, so the runner runs them, not an agent."""
     results = []
+    env = check_env()
     for cmd in checks:
         try:
-            r = subprocess.run(cmd, shell=True, cwd=worktree, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(cmd, shell=True, cwd=worktree, capture_output=True, text=True, timeout=timeout,
+                               env=env)
             results.append({"cmd": cmd, "ok": r.returncode == 0, "tail": (r.stdout + r.stderr).strip()[-1500:]})
         except subprocess.TimeoutExpired:
             results.append({"cmd": cmd, "ok": False, "tail": f"timed out after {timeout // 60} min"})
