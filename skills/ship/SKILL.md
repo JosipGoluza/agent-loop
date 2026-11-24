@@ -52,6 +52,7 @@ that neither ticket's behaviour was dropped or changed. This can take a few minu
 - each ticket's `status`:
   - `built`: ready to publish. `parent` is its PR base. `resolved` says what an agent changed
     after the rebase, and `stat` is its diff. `findings` on a `built` ticket are advisory.
+    `relined` says the sprint moved it onto another ticket with a clean rebase after its review.
   - `stopped`: it could not be finished. `reason` says why and what to do. `conflicts` lists the
     files the resolve agent could not resolve.
   - `waiting`: above a stopped ticket. It is published when that ticket is fixed.
@@ -107,7 +108,8 @@ Show the high-risk tickets first (`risk: high` in the handoff). For each one:
 - Show the full diff of those files (`git -C <worktree> diff <parent> HEAD -- <paths>`).
 
 Then show each stack, bottom to top: each ticket's ref, name, PR base and diff stat, what an agent
-resolved after the rebase (show that diff too), and its combine `findings` right below that diff,
+resolved after the rebase (show that diff too), its `relined` line when it has one ("moved after its
+review: clean rebase, checks passed"), and its combine `findings` right below that diff,
 as plain text (file:line, what changed or was lost, evidence). These findings are advisory: the
 user may fix them in the worktree and run ship again, or publish as is. Also show its **Open
 review findings** and **Pre-existing issues** (offer to make tickets for them). Show the stack's

@@ -825,6 +825,7 @@ def make_targets(path: Path) -> list[str]:
 
 def detect(start: Path, tracker_url: str | None) -> dict:
     """Facts about the repo and a config suggested from them; the setup wizard confirms the rest."""
+    import stacking
     common = git_common_dir(start)
     if not common:
         raise SystemExit("Not inside a git repository.")
@@ -910,7 +911,7 @@ def detect(start: Path, tracker_url: str | None) -> dict:
             "reviewFile": (main / "REVIEW.md").is_file(),
             "agentsForbidCommits": bool(re.search(r"(?i)git commit.{0,120}(confirm|only after)", agents_md)),
             "host": session_host(),
-            "ghStack": __import__("stacking").gh_stack_installed(),
+            "ghStack": stacking.gh_stack_installed(),
             "credentials": {
                 "trello": bool(os.environ.get("TRELLO_KEY") and os.environ.get("TRELLO_TOKEN")),
                 "jira": bool(os.environ.get("JIRA_EMAIL") and os.environ.get("JIRA_API_TOKEN")),
@@ -1333,6 +1334,8 @@ def reline(p: Project, run, x: dict, below: dict) -> dict | None:
         stacking.set_meta(handoff, "commit", commit)
         if st.get("resolved"):
             stacking.set_meta(handoff, "resolved", f"moved onto {below['ref']} during the sprint, and an agent combined the two")
+        else:  # a clean rebase: nothing to review, but its reviewed commit changed
+            stacking.set_meta(handoff, "relined", f"moved onto {below['ref']} during the sprint (clean rebase, checks passed)")
     return None
 
 
@@ -1421,7 +1424,8 @@ def cmd_stack(a) -> None:
     squash = []
     for s in stacks:
         for x in s["tickets"]:
-            own = stacking.own_commits(x["worktree"], x) if x["rebase"] and Path(x["worktree"]).is_dir() else []
+            onto = stacking.onto_for(x, stacking.trunk_of(cfg["base"]), s["anchor"]) if Path(x["worktree"]).is_dir() else ""
+            own = stacking.own_commits(x["worktree"], x, onto) if x["rebase"] and onto else []
             if own and len(own) > 1:
                 squash.append({"ref": t.ref(x["id"]), "id": x["id"], "worktree": x["worktree"], "commits": len(own)})
     if a.action == "build":
@@ -1432,7 +1436,7 @@ def cmd_stack(a) -> None:
         stacks = builder.build(stacks)
         stacking.commands(stacks, cfg["repo"], str(p.root), p.dir, prs, bool(cfg["pr"].get("draft")))
     keep = ("id", "title", "branch", "base", "parent", "worktree", "risk", "sensitive", "path", "rebase", "status", "reason",
-            "rebased", "resolved", "checks", "findings", "conflicts", "commit", "stat")
+            "rebased", "resolved", "relined", "checks", "findings", "conflicts", "commit", "stat")
     print(json.dumps({"mode": mode, "link": link, "warnings": warnings, "squash": squash, "stacks": [
         {**{k: v for k, v in s.items() if k != "tickets"},
          "tickets": [{"ref": t.ref(x["id"]), **{k: x[k] for k in keep if k in x}} for x in s["tickets"]]} for s in stacks]}, indent=2))

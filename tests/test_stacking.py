@@ -155,6 +155,7 @@ class StackingTest(unittest.TestCase):
         self.assertIn("base: feat/3-three", note)
         self.assertIn(f"commit: {one}", note)
         self.assertNotIn("resolved:", note)  # a clean rebase: nothing for ship to review
+        self.assertIn("relined: moved onto #3 during the sprint (clean rebase, checks passed)", note)  # but ship says it moved
         state = json.loads((self.run_dir / "run.json").read_text())
         self.assertEqual(state["tickets"]["1"]["commit"], one)
         self.assertEqual({t["id"]: t["base"] for t in state["prepared"]}["1"], "feat/3-three")

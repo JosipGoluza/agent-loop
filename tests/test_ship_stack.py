@@ -131,6 +131,34 @@ class ShipStackTest(unittest.TestCase):
         self.assertEqual([t["status"] for t in out["stacks"][0]["tickets"]], ["built", "built"])
         self.assertEqual(git("-C", str(self.worktree("3")), "log", "-2", "--format=%s"), "feat: ticket 3\nfeat: ticket 1")
 
+    def test_a_ticket_with_nothing_to_ship_stops_its_stack(self):
+        self.tearDown()
+        StackingTest.setUp(self, commits=False)
+        self.configure(stack="sprint")
+        self.start("1", "3")
+        self.finish_ready("1")
+        self.finish_ready("3", change="three = 3\n")
+        stacking.set_meta(self.state / "handoffs" / "3.md", "updated", "2099-01-01T00:00:00")
+        git("-C", str(self.worktree("1")), "reset", "-q")  # someone unstaged #1: no commit, nothing staged
+        out = self.stack("build")
+        s = out["stacks"][0]
+        self.assertEqual([(t["id"], t["status"]) for t in s["tickets"]], [("1", "stopped"), ("3", "waiting")])
+        self.assertIn("nothing to ship", s["tickets"][0]["reason"])
+        self.assertEqual(s["commands"], [])
+
+    def test_plan_counts_the_commits_of_a_ticket_rebased_by_hand(self):
+        self.start("1", "3")
+        self.finish_ready("1")
+        self.finish_ready("3", change="three = 3\n")
+        stacking.set_meta(self.state / "handoffs" / "3.md", "updated", "2099-01-01T00:00:00")
+        wt = str(self.worktree("3"))
+        git("-C", wt, "rebase", "-q", "--onto", "feat/1-one", "origin/main")  # its handoff commit is gone
+        Path(wt, "more.py").write_text("m = 1\n")
+        git("-C", wt, "add", "more.py")
+        git("-C", wt, "commit", "-qm", "fix: more")
+        out = self.stack("plan")
+        self.assertEqual([(x["id"], x["commits"]) for x in out["squash"]], [("3", 2)])
+
     def conflicting(self):
         """Tickets 1 and 3 both change a.py, each in its one handoff commit; 3 finishes last, so it
         goes on top of 1."""

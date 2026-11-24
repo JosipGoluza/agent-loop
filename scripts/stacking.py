@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -217,6 +218,14 @@ def onto_ref(wt: str, parent: str, trunk: str, anchor: dict) -> str:
     return parent if rev(wt, f"refs/heads/{parent}") else f"origin/{parent}"
 
 
+def onto_for(t: dict, trunk: str, anchor: dict) -> str:
+    """The ref ticket `t` of a planned stack goes onto (plan and build must agree on it)."""
+    wt, parent = t["worktree"], t["parent"]
+    if anchor["kind"] != "foreign":
+        return onto_ref(wt, parent, trunk, anchor)
+    return parent if rev(wt, f"refs/heads/{parent}") else f"origin/{parent}"
+
+
 RESOLVE_SCHEMA = runner.SCHEMAS["build"]
 COMBINE_SCHEMA = runner.SCHEMAS["findings"]
 
@@ -389,6 +398,8 @@ class Builder:
         if error:
             return [], f"the commit failed: {error}"
         own = own_commits(wt, t, onto) or []
+        if not own:
+            return [], "it has no commit and nothing staged: there is nothing to ship"
         if len(own) > 1:
             if not self.squash:
                 return [], (f"it has {len(own)} commits; ship squashes them into one, named after its handoff commit "
@@ -477,10 +488,7 @@ class Builder:
                     t.update(status="waiting", reason=f"waits for {self.ref(stopped)}")
                     continue
                 wt = t["worktree"]
-                if s["anchor"]["kind"] != "foreign":
-                    onto = onto_ref(wt, t["parent"], self.trunk, s["anchor"])
-                else:
-                    onto = t["parent"] if rev(wt, f"refs/heads/{t['parent']}") else f"origin/{t['parent']}"
+                onto = onto_for(t, self.trunk, s["anchor"])
                 if t["rebase"]:
                     r = self.ticket(t, onto, prev)
                 else:
@@ -526,8 +534,10 @@ def commands(stacks: list[dict], repo: str, root: str, state_dir: Path, prs: lis
 
 
 def gh_stack_installed() -> bool:
+    if not shutil.which("gh"):
+        return False
     try:
-        return subprocess.run(["gh", "stack", "--version"], capture_output=True, text=True, timeout=30).returncode == 0
+        return subprocess.run(["gh", "stack", "--version"], capture_output=True, text=True, timeout=10).returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
