@@ -1,0 +1,1769 @@
+#!/usr/bin/env python3
+"""agent-loop CLI: project brief, ticket selection, worktrees, handoffs and board moves.
+
+Everything the skills and the sprint workflow need from the outside world goes through here,
+so the workflow script itself never touches the filesystem or the network.
+
+A project's state lives in an agent-loop directory holding `config.json`, found from the
+current directory in this order:
+
+1. `.agent-loop/` in the current directory or any parent (a bare repo whose worktrees are
+   sibling folders, like `<root>/.git` + `<root>/main` + `<root>/812`);
+2. `agent-loop/` inside the repository's shared git directory (`<clone>/.git/agent-loop`),
+   which every worktree of the clone resolves to and which git never shows as untracked.
+
+Trackers: Trello, GitHub Projects and Jira. Credentials come from the environment or from
+`gh auth`, never from a file:
+
+    Trello  TRELLO_KEY, TRELLO_TOKEN
+    Jira    JIRA_EMAIL, JIRA_API_TOKEN
+    GitHub  `gh auth login` with the `project` scope (`gh auth refresh -s project`)
+
+Commands:
+
+    detect [--tracker-url URL]      what the repo looks like, and a suggested config (JSON)
+    init [--config FILE] [--store root|git] [--root DIR]
+                                    install a config (default: the template) and scaffold the rest
+    doctor                          check config, credentials, tracker columns, repo and checks
+    statuses [--config FILE]        the tracker's column names
+    show-config                     the resolved config plus root and dir (JSON)
+    brief [--hook] [--json]         the project brief (--hook: SessionStart JSON, silent outside a project)
+    tickets [ID ...] [--all]        ticket objects as JSON (default: the ready ones)
+    prepare ID [ID ...] [--force]   create or reuse each ticket's worktree and run setup
+                                    (--force: also for blocked tickets, on the configured base)
+    run [ID ...] [--plan] [--force] [--detach] [--resume RUN [--build]]
+                                    the loop over the ids (default: every ready ticket); --plan stops
+                                    after planning (--resume RUN --build carries on with those plans);
+                                    --detach runs it in the background
+    status [RUN] [--json]           where a run is (default: the latest)
+    findings [--runs N] [--json]    review findings that recur across recent runs, to fix at the source
+    ingest PATH ... [--kind K] [--title T] [--date D] [--id ID]
+                                    copy a file or folder into the project knowledge, with text versions
+    knowledge [--json]              the knowledge index
+    annotate ID [--summary S] [--use U] [--title T] [--kind K] [--date D] [--status new|distilled]
+    handoffs [--status S]           handoff notes as JSON
+    mark ID STATUS [--pr URL]       set a handoff's status (ready, needs-human, shipped)
+    stack plan|build [IDS] [--squash]  internal, for the ship skill: the PR stacks of the ready tickets
+    move ID COLUMN_KEY              move a ticket to a configured column (ready, doing, review) or a named one
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import knowledge  # noqa: E402
+NET_TIMEOUT = 15
+
+DEFAULT_CONFIG = {
+    "name": "",
+    "repo": "",
+    "base": "origin/main",
+    "mainWorktree": ".",
+    "worktreePath": "{root}/../{repo}-worktrees/{id}",
+    "branch": "{type}/{slug}",
+    "typeByLabel": {"bug": "fix", "chore": "chore"},
+    "defaultType": "feat",
+    "setup": [],
+    "checks": [],
+    "exclusive": [],
+    "contextFiles": [],
+    "maxParallel": 10,
+    "maxFixRounds": 2,
+    "agents": {"default": "claude", "plan": None, "implement": None, "review": None, "fix": None, "handoff": None},
+    "agentModels": {},
+    "agentArgs": {},
+    "agentTimeoutMinutes": 30,
+    "review": {"lenses": ["spec", "correctness", "standards"], "verify": True, "votes": 3, "file": "REVIEW.md",
+               "scopeIgnore": ["*.lock", "package-lock.json", "pnpm-lock.yaml", "poetry.lock", "uv.lock"]},
+    "sensitivePaths": [],
+    "commitAtHandoff": True,
+    "tracker": {
+        "type": "trello",
+        "columns": {"ready": "Sprint Backlog", "doing": "In Progress", "review": "Code Review"},
+        "show": ["Sprint Backlog", "In Progress", "Code Review"],
+        "done": ["Done"],
+        "blockerSection": "Blockers",
+    },
+    "pr": {
+        "template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "ticketLine": "#### Ticket [{ref}]({url})",
+        "draft": False,
+        "stack": "chains",
+        "ghStack": True,
+    },
+}
+
+
+# --- config and project -----------------------------------------------------------
+
+def merged(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = merged(base[k], v) if isinstance(v, dict) and isinstance(base.get(k), dict) else v
+    return out
+
+
+def normalize(cfg: dict) -> dict:
+    """Accept the 0.1 config shape (top-level `trello`, `prDraft`)."""
+    cfg = dict(cfg)
+    if "trello" in cfg and "tracker" not in cfg:
+        t = cfg.pop("trello")
+        cfg["tracker"] = {"type": "trello", "board": t.get("board", ""), "columns": t.get("lists", {}),
+                          **{k: t[k] for k in ("show", "done") if k in t}}
+        cfg.setdefault("worktreePath", "{root}/{id}")
+        cfg.setdefault("mainWorktree", "main")
+    if "prDraft" in cfg:
+        cfg.setdefault("pr", {})["draft"] = cfg.pop("prDraft")
+    return merged(DEFAULT_CONFIG, cfg)
+
+
+@dataclass
+class Project:
+    root: Path
+    dir: Path
+    config: dict
+
+    @property
+    def repo_name(self) -> str:
+        return (self.config["repo"].rsplit("/", 1)[-1] if self.config["repo"] else "") or self.root.name
+
+    @property
+    def main(self) -> Path:
+        return (self.root / self.config["mainWorktree"]).resolve()
+
+    def worktree(self, ticket_id: str) -> Path:
+        path = self.config["worktreePath"].format(root=self.root, id=ticket_id, repo=self.repo_name)
+        return Path(os.path.normpath(path))
+
+
+def git_common_dir(start: Path) -> Path | None:
+    out = subprocess.run(["git", "-C", str(start), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                         capture_output=True, text=True)
+    return Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
+
+
+def main_worktree(start: Path) -> Path | None:
+    """The checkout a ticket worktree was cut from: a git-excluded `.agent-loop/` lives only there."""
+    out = subprocess.run(["git", "-C", str(start), "worktree", "list", "--porcelain"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    for entry in out.stdout.split("\n\n"):
+        lines = entry.splitlines()
+        if lines and lines[0].startswith("worktree ") and "bare" not in lines[1:]:
+            return Path(lines[0].removeprefix("worktree "))
+    return None
+
+
+def find_project(start: Path | None = None, config_file: Path | None = None) -> Project | None:
+    here = (start or Path.cwd()).resolve()
+    if config_file:
+        common = git_common_dir(here)
+        root = common.parent if common else here
+        return Project(root, config_file.resolve().parent, normalize(json.loads(config_file.read_text())))
+    for d in (here, *here.parents):
+        cfg = d / ".agent-loop" / "config.json"
+        if cfg.is_file():
+            return Project(d, cfg.parent, normalize(json.loads(cfg.read_text())))
+    main = main_worktree(here) if here.exists() else None
+    if main and (main / ".agent-loop" / "config.json").is_file():
+        cfg = main / ".agent-loop" / "config.json"
+        return Project(main, cfg.parent, normalize(json.loads(cfg.read_text())))
+    common = git_common_dir(here) if here.exists() else None
+    if common and (common / "agent-loop" / "config.json").is_file():
+        cfg = common / "agent-loop" / "config.json"
+        return Project(common.parent, cfg.parent, normalize(json.loads(cfg.read_text())))
+    return None
+
+
+def require_project(config_file: str | None = None) -> Project:
+    p = find_project(config_file=Path(config_file) if config_file else None)
+    if not p:
+        raise SystemExit("No agent-loop config for this directory; run /agent-loop:setup (or `agentloop.py init`).")
+    return p
+
+
+# --- outside world (patched in tests) -------------------------------------------
+
+def http_json(method: str, url: str, headers: dict | None = None, data: bytes | None = None):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as r:
+            body = r.read()
+            return json.loads(body) if body else None
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} on {method} {url.split('?')[0]}: {e.read().decode()[:200]}") from e
+
+
+def gh(*args: str) -> str:
+    out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+    if out.returncode:
+        raise RuntimeError(f"gh {' '.join(args[:3])}: {out.stderr.strip()[:300]}")
+    return out.stdout
+
+
+def gh_json(*args: str):
+    return json.loads(gh(*args) or "null")
+
+
+def git(root: Path, *args: str, check: bool = True) -> str:
+    out = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+    if check and out.returncode:
+        raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()}")
+    return out.stdout
+
+
+# --- trackers ---------------------------------------------------------------
+
+@dataclass
+class Board:
+    """Tickets normalized across trackers: {id, name, url, status, labels, desc, blockers}."""
+
+    cards: list[dict] = field(default_factory=list)
+    resolved: set[str] = field(default_factory=set)      # known done/closed/archived, on the board or not
+    open_elsewhere: set[str] = field(default_factory=set)  # known open but not on the board
+
+
+def text_blockers(desc: str, section: str | None) -> list[str]:
+    found: list[str] = []
+    if section:
+        m = re.search(rf"#+\s*{re.escape(section)}\s*\n(.*?)(?=\n#+\s|\Z)", desc or "", re.S | re.I)
+        if m:
+            found += re.findall(r"#(\d+)", m.group(1))
+    for m in re.finditer(r"(?:blocked by|depends on)\s*:?\s*((?:#\d+(?:\s*,\s*|\s+and\s+|\s*))+)", desc or "", re.I):
+        found += re.findall(r"#(\d+)", m.group(1))
+    return list(dict.fromkeys(found))
+
+
+class Tracker:
+    kind = ""
+    id_pattern = r"\d+"
+
+    def __init__(self, cfg: dict, repo: str, state_dir: Path | None = None):
+        self.cfg, self.repo, self.state_dir = cfg, repo, state_dir
+
+    def ref(self, ticket_id: str) -> str:
+        return f"#{ticket_id}" if ticket_id.isdigit() else ticket_id
+
+    def norm_id(self, raw: str) -> str:
+        return raw.lstrip("#").upper()
+
+    def missing_creds(self) -> str | None:
+        return None
+
+    def fetch(self) -> Board:
+        raise NotImplementedError
+
+    def columns(self) -> list[str]:
+        raise NotImplementedError
+
+    def move(self, ticket_id: str, column: str) -> str:
+        raise NotImplementedError
+
+
+class TrelloTracker(Tracker):
+    kind = "trello"
+    BASE = "https://api.trello.com/1"
+
+    def missing_creds(self):
+        if not (os.environ.get("TRELLO_KEY") and os.environ.get("TRELLO_TOKEN")):
+            return "export TRELLO_KEY and TRELLO_TOKEN before starting the session"
+        return None
+
+    def api(self, method: str, path: str, **params):
+        """`path` must NOT carry a query string: params are encoded here, once."""
+        params.update(key=os.environ["TRELLO_KEY"], token=os.environ["TRELLO_TOKEN"])
+        qs = urllib.parse.urlencode(params)
+        if method == "GET":
+            return http_json("GET", f"{self.BASE}/{path}?{qs}")
+        return http_json(method, f"{self.BASE}/{path}", data=qs.encode())
+
+    def columns(self):
+        return [x["name"] for x in self.api("GET", f"boards/{self.cfg['board']}/lists", fields="name")]
+
+    def fetch(self):
+        b = self.cfg["board"]
+        names = {x["id"]: x["name"] for x in self.api("GET", f"boards/{b}/lists", fields="name")}
+        raw = self.api("GET", f"boards/{b}/cards", fields="name,idShort,idList,desc,labels,url", limit=1000)
+        closed = self.api("GET", f"boards/{b}/cards/closed", fields="idShort", limit=1000)
+        cards = [{
+            "id": str(c["idShort"]), "name": c["name"], "url": c.get("url", ""),
+            "status": names.get(c["idList"], "?"), "desc": c.get("desc", ""),
+            "labels": [lab["name"] for lab in c.get("labels", []) if lab.get("name")],
+            "blockers": text_blockers(c.get("desc", ""), self.cfg.get("blockerSection")),
+        } for c in raw]
+        return Board(cards, {str(c["idShort"]) for c in closed})
+
+    def move(self, ticket_id, column):
+        b = self.cfg["board"]
+        lists = {x["name"]: x["id"] for x in self.api("GET", f"boards/{b}/lists", fields="name")}
+        if column not in lists:
+            raise RuntimeError(f"No list named {column!r} on the board")
+        card = self.api("GET", f"boards/{b}/cards/{ticket_id}", fields="id,name")
+        self.api("PUT", f"cards/{card['id']}", idList=lists[column])
+        return card["name"]
+
+
+class GitHubTracker(Tracker):
+    """A GitHub Projects (v2) board whose single-select Status field is the column."""
+
+    kind = "github"
+
+    @property
+    def status_field(self) -> str:
+        return self.cfg.get("statusField") or "Status"
+
+    def project_args(self) -> list[str]:
+        return [str(self.cfg["project"]), "--owner", self.cfg["owner"]]
+
+    def columns(self):
+        fields = gh_json("project", "field-list", *self.project_args(), "--format", "json", "--limit", "100")
+        for f in fields.get("fields", []):
+            if f.get("name") == self.status_field:
+                return [o["name"] for o in f.get("options", [])]
+        raise RuntimeError(f"The project has no field named {self.status_field!r}")
+
+    def fetch(self):
+        data = gh_json("project", "item-list", *self.project_args(), "--format", "json", "--limit", "1000")
+        key = self.status_field.lower()
+        cards = []
+        for item in data.get("items", []):
+            c = item.get("content") or {}
+            repo = c.get("repository") or ""
+            if c.get("type") != "Issue" or (self.repo and not repo.endswith(self.repo)):
+                continue
+            body = c.get("body") or ""
+            labels = item.get("labels") or c.get("labels") or []
+            cards.append({
+                "id": str(c["number"]), "name": c.get("title") or item.get("title", ""), "url": c.get("url", ""),
+                "status": item.get(key) or "No status", "desc": body,
+                "labels": [lab["name"] if isinstance(lab, dict) else lab for lab in labels],
+                "blockers": text_blockers(body, self.cfg.get("blockerSection")),
+            })
+        board = Board(cards)
+        if self.repo:
+            closed = gh_json("issue", "list", "-R", self.repo, "--state", "closed", "--limit", "1000", "--json", "number")
+            board.resolved = {str(i["number"]) for i in closed}
+            on_board = {c["id"] for c in cards}
+            opened = gh_json("issue", "list", "-R", self.repo, "--state", "open", "--limit", "1000", "--json", "number")
+            board.open_elsewhere = {str(i["number"]) for i in opened} - on_board
+            ready = self.cfg["columns"].get("ready")
+            for c in cards:
+                if c["status"] != ready:
+                    continue
+                try:  # native "blocked by" dependencies, where the repo has them
+                    deps = gh_json("api", f"repos/{self.repo}/issues/{c['id']}/dependencies/blocked_by")
+                    for dep in deps:
+                        n = str(dep["number"])
+                        if n not in c["blockers"]:
+                            c["blockers"].append(n)
+                        if n not in on_board:
+                            (board.resolved if dep.get("state") == "closed" else board.open_elsewhere).add(n)
+                except (RuntimeError, TypeError, KeyError):
+                    pass
+        return board
+
+    def move(self, ticket_id, column):
+        url = f"https://github.com/{self.repo}/issues/{ticket_id}"
+        gh("project", "item-edit", *self.project_args(), "--url", url, "--field", self.status_field, "--value", column)
+        return url
+
+
+def adf_text(node) -> str:
+    """Flatten Atlassian Document Format to markdown-ish text: paragraphs, headings, list items."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(adf_text(n) for n in node)
+    t, kids = node.get("type"), adf_text(node.get("content", []))
+    if t == "text":
+        return node.get("text", "")
+    if t == "heading":
+        return "#" * node.get("attrs", {}).get("level", 3) + " " + kids + "\n\n"
+    if t == "paragraph":
+        return kids + "\n\n"
+    if t == "listItem":
+        return "- " + kids.strip() + "\n"
+    if t in ("bulletList", "orderedList"):
+        return kids + "\n"
+    if t == "hardBreak":
+        return "\n"
+    if t == "inlineCard":
+        return node.get("attrs", {}).get("url", "")
+    return kids
+
+
+class JiraTracker(Tracker):
+    kind = "jira"
+    id_pattern = r"[A-Za-z][A-Za-z0-9_]*-\d+"
+
+    def missing_creds(self):
+        if not (os.environ.get("JIRA_EMAIL") and os.environ.get("JIRA_API_TOKEN")):
+            return "export JIRA_EMAIL and JIRA_API_TOKEN before starting the session"
+        return None
+
+    @property
+    def site(self) -> str:
+        return self.cfg["site"].rstrip("/")
+
+    def api(self, method: str, path: str, body: dict | None = None, **params):
+        auth = base64.b64encode(f"{os.environ['JIRA_EMAIL']}:{os.environ['JIRA_API_TOKEN']}".encode()).decode()
+        headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
+        url = f"{self.site}/rest/api/3/{path}" + (f"?{urllib.parse.urlencode(params)}" if params else "")
+        return http_json(method, url, headers, json.dumps(body).encode() if body is not None else None)
+
+    def jql(self) -> str:
+        return self.cfg.get("jql") or f"project = {self.cfg['project']} AND sprint in openSprints() ORDER BY Rank"
+
+    def columns(self):
+        names: list[str] = []
+        for issue_type in self.api("GET", f"project/{self.cfg['project']}/statuses"):
+            names += [s["name"] for s in issue_type.get("statuses", []) if s["name"] not in names]
+        return names
+
+    def fetch(self):
+        board, token = Board(), None
+        fields = "summary,status,labels,description,issuelinks,issuetype"
+        for _ in range(20):
+            params = {"jql": self.jql(), "fields": fields, "maxResults": 100}
+            if token:
+                params["nextPageToken"] = token
+            page = self.api("GET", "search/jql", **params)
+            for issue in page.get("issues", []):
+                f = issue["fields"]
+                blockers = []
+                for link in f.get("issuelinks", []):
+                    other = link.get("inwardIssue")
+                    if not other or link.get("type", {}).get("inward", "").lower() != "is blocked by":
+                        continue
+                    blockers.append(other["key"])
+                    category = other.get("fields", {}).get("status", {}).get("statusCategory", {}).get("key")
+                    (board.resolved if category == "done" else board.open_elsewhere).add(other["key"])
+                labels = list(f.get("labels") or [])
+                if f.get("issuetype", {}).get("name"):
+                    labels.append(f["issuetype"]["name"])
+                board.cards.append({
+                    "id": issue["key"], "name": f.get("summary", ""), "url": f"{self.site}/browse/{issue['key']}",
+                    "status": f.get("status", {}).get("name", "?"), "desc": adf_text(f.get("description")).strip(),
+                    "labels": labels, "blockers": blockers,
+                })
+            token = page.get("nextPageToken")
+            if not token or page.get("isLast"):
+                break
+        on_board = {c["id"] for c in board.cards}
+        board.open_elsewhere -= on_board
+        return board
+
+    def move(self, ticket_id, column):
+        options = self.api("GET", f"issue/{ticket_id}/transitions").get("transitions", [])
+        match = next((t for t in options if t.get("to", {}).get("name") == column or t.get("name") == column), None)
+        if not match:
+            raise RuntimeError(f"{ticket_id} has no transition to {column!r}; available: "
+                               + ", ".join(t.get("to", {}).get("name", t.get("name", "?")) for t in options))
+        self.api("POST", f"issue/{ticket_id}/transitions", {"transition": {"id": match["id"]}})
+        return ticket_id
+
+
+class FileTracker(Tracker):
+    """Tickets in a JSON file in the agent-loop folder: for trying the loop out, and for teams without a board.
+
+    `tickets.json` is a list of {id, name, status, desc?, labels?, blockers?, url?}.
+    """
+
+    kind = "file"
+    id_pattern = r"[A-Za-z][A-Za-z0-9_]*-\d+|\d+"
+
+    @property
+    def path(self) -> Path:
+        return (self.state_dir or Path.cwd()) / self.cfg.get("file", "tickets.json")
+
+    def load(self) -> list[dict]:
+        if not self.path.is_file():
+            raise RuntimeError(f"No tickets file at {self.path}")
+        return json.loads(self.path.read_text())
+
+    def columns(self):
+        c = self.cfg
+        return list(dict.fromkeys([*c["columns"].values(), *c["show"], *c["done"]]))
+
+    def fetch(self):
+        cards = [{
+            "id": self.norm_id(str(t["id"])), "name": t["name"], "url": t.get("url", ""),
+            "status": t.get("status", ""), "desc": t.get("desc", ""), "labels": t.get("labels", []),
+            "blockers": [self.norm_id(str(b)) for b in t.get("blockers", [])]
+                        or text_blockers(t.get("desc", ""), self.cfg.get("blockerSection")),
+        } for t in self.load()]
+        return Board(cards)
+
+    def move(self, ticket_id, column):
+        tickets = self.load()
+        for t in tickets:
+            if self.norm_id(str(t["id"])) == ticket_id:
+                t["status"] = column
+                self.path.write_text(json.dumps(tickets, indent=2) + "\n")
+                return t["name"]
+        raise RuntimeError(f"No ticket {ticket_id} in {self.path}")
+
+
+TRACKERS = {t.kind: t for t in (TrelloTracker, GitHubTracker, JiraTracker, FileTracker)}
+
+
+def tracker_for(p: Project) -> Tracker:
+    kind = p.config["tracker"]["type"]
+    if kind not in TRACKERS:
+        raise SystemExit(f"Unknown tracker type {kind!r}; use one of {', '.join(TRACKERS)}")
+    return TRACKERS[kind](p.config["tracker"], p.config["repo"], p.dir)
+
+
+def parse_tracker_url(url: str) -> dict:
+    u = urllib.parse.urlparse(url.strip())
+    parts = [x for x in u.path.split("/") if x]
+    if u.netloc.endswith("trello.com") and len(parts) >= 2 and parts[0] == "b":
+        return {"type": "trello", "board": parts[1]}
+    if u.netloc == "github.com" and len(parts) >= 4 and parts[0] in ("orgs", "users") and parts[2] == "projects":
+        return {"type": "github", "owner": parts[1], "project": int(parts[3])}
+    if u.netloc.endswith(".atlassian.net"):
+        site = f"{u.scheme or 'https'}://{u.netloc}"
+        if "projects" in parts and parts.index("projects") + 1 < len(parts):
+            return {"type": "jira", "site": site, "project": parts[parts.index("projects") + 1]}
+        if "browse" in parts and parts.index("browse") + 1 < len(parts):
+            return {"type": "jira", "site": site, "project": parts[parts.index("browse") + 1].split("-")[0]}
+        return {"type": "jira", "site": site}
+    raise SystemExit(f"Not a Trello board, GitHub project or Jira URL: {url}")
+
+
+# --- snapshot and classification ---------------------------------------------
+
+@dataclass
+class Snapshot:
+    """Everything the brief and the ticket selection read, fetched once."""
+
+    tracker: Tracker
+    board: Board
+    open_prs: list[dict]
+    merged_prs: list[dict]
+    worktrees: dict[str, str]      # branch -> path
+    errors: list[str]
+
+    def by_id(self) -> dict[str, dict]:
+        return {c["id"]: c for c in self.board.cards}
+
+    def branch_id(self, branch: str) -> str | None:
+        m = re.match(rf"^(?:[\w.-]+/)?({self.tracker.id_pattern})(?:[-_]|$)", branch or "")
+        return self.tracker.norm_id(m.group(1)) if m else None
+
+    def pr_for(self, ticket_id: str) -> dict | None:
+        return next((p for p in self.open_prs if self.branch_id(p["headRefName"]) == ticket_id), None)
+
+    def merged_ids(self) -> set[str]:
+        return {i for p in self.merged_prs if (i := self.branch_id(p["headRefName"])) is not None}
+
+    def worktree_for(self, ticket_id: str) -> tuple[str, str] | None:
+        return next(((b, path) for b, path in self.worktrees.items() if self.branch_id(b) == ticket_id), None)
+
+
+def snapshot(p: Project) -> Snapshot:
+    t = tracker_for(p)
+    s = Snapshot(t, Board(), [], [], {}, [])
+    missing = t.missing_creds()
+    if missing:
+        s.errors.append(f"Board unavailable: {missing}.")
+    else:
+        try:
+            s.board = t.fetch()
+        except (RuntimeError, OSError, KeyError, subprocess.TimeoutExpired) as e:
+            hint = " (run `gh auth refresh -s project`)" if "scope" in str(e) else ""
+            s.errors.append(f"Board unavailable: {e}{hint}")
+    if p.config["repo"]:
+        try:
+            fields = "number,title,headRefName,baseRefName,isDraft,reviewDecision,url"
+            s.open_prs = gh_json("pr", "list", "-R", p.config["repo"], "--state", "open", "--limit", "50", "--json", fields)
+            s.merged_prs = gh_json("pr", "list", "-R", p.config["repo"], "--state", "merged", "--limit", "30", "--json", "number,title,headRefName,mergedAt")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            s.errors.append(f"GitHub unavailable: {e}")
+    try:
+        path = None
+        for line in git(p.root, "worktree", "list", "--porcelain").splitlines():
+            if line.startswith("worktree "):
+                path = line[9:]
+            elif line.startswith("branch refs/heads/") and path:
+                s.worktrees[line[18:]] = path
+    except RuntimeError as e:
+        s.errors.append(str(e))
+    return s
+
+
+def slug_of(card: dict) -> str:
+    """The Trello card URL's own slug (`816-every-step-belongs-to-an-agent`), else id plus the name's words."""
+    tail = (card.get("url") or "").rstrip("/").rsplit("/", 1)[-1]
+    if "trello.com" in (card.get("url") or "") and tail.startswith(f"{card['id']}-"):
+        return tail[:70].rstrip("-")
+    words = re.sub(r"[^a-z0-9]+", "-", card["name"].lower()).strip("-")
+    return f"{card['id'].lower()}-{words}"[:70].rstrip("-")
+
+
+def worktree_in_use(p: Project, ticket_id: str, path: str) -> bool:
+    """A ticket's worktree holds work when it has changes, commits past the base, or a handoff note.
+    An untouched one (prepared, then deferred) is reused rather than blocking the ticket."""
+    if (p.dir / "handoffs" / f"{ticket_id}.md").is_file():
+        return True
+    wt = Path(path)
+    if not wt.is_dir():
+        return False
+    if git(wt, "status", "--porcelain", "--untracked-files=no", check=False).strip():
+        return True  # untracked files alone (a copied .env, caches) are setup, not work
+    ahead = git(wt, "rev-list", "--count", f"{p.config['base']}..HEAD", check=False).strip()
+    return ahead not in ("", "0")
+
+
+def classify(p: Project, s: Snapshot, card: dict) -> dict:
+    """One ticket object: what it is, whether an agent may start it, and on which base."""
+    tcfg = p.config["tracker"]
+    cards = s.by_id()
+    done = set(tcfg["done"])
+    merged_ids = s.merged_ids()
+    cid = card["id"]
+    by_label = {k.lower(): v for k, v in p.config["typeByLabel"].items()}
+    kind = next((by_label[lab.lower()] for lab in card["labels"] if lab.lower() in by_label), p.config["defaultType"])
+
+    open_blockers = []
+    for b in card["blockers"]:
+        other = cards.get(b)
+        if b in s.board.resolved or b in merged_ids or (other and other["status"] in done):
+            continue
+        if other is None and b not in s.board.open_elsewhere:
+            continue  # a dead reference blocks nothing; the brief flags it
+        open_blockers.append(b)
+
+    base, status, reason = p.config["base"], "ready", ""
+    wt, pr = s.worktree_for(cid), s.pr_for(cid)
+    ref = s.tracker.ref
+    if pr:
+        status, reason = "in-flight", f"PR #{pr['number']} open"
+    elif wt and worktree_in_use(p, cid, wt[1]):
+        status, reason = "in-flight", f"worktree {wt[1]}"
+    elif open_blockers:
+        stack = [s.pr_for(b) for b in open_blockers]
+        if len(open_blockers) == 1 and stack[0]:
+            base, reason = f"origin/{stack[0]['headRefName']}", f"stacked on {ref(open_blockers[0])} (PR #{stack[0]['number']})"
+        else:
+            status, reason = "blocked", "waiting on " + ", ".join(ref(b) for b in open_blockers)
+
+    branch = wt[0] if wt else p.config["branch"].format(type=kind, slug=slug_of(card), id=cid)
+    return {
+        "id": cid,
+        "ref": ref(cid),
+        "name": card["name"],
+        "url": card["url"],
+        "list": card["status"],
+        "labels": card["labels"],
+        "desc": card["desc"],
+        "status": status,
+        "reason": reason,
+        "blockers": open_blockers,
+        "branch": branch,
+        "base": base,
+        "worktree": wt[1] if wt else str(p.worktree(cid)),
+    }
+
+
+# --- handoffs ----------------------------------------------------------------
+
+def read_handoff(path: Path) -> dict:
+    text = path.read_text()
+    meta, body = {}, text
+    if text.startswith("---\n") and "\n---" in text[4:]:
+        head, body = text[4:].split("\n---", 1)
+        for line in head.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                meta[k.strip()] = v.strip()
+    return {**meta, "id": meta.get("id") or path.stem, "path": str(path), "body": body.strip()}
+
+
+def handoffs(p: Project) -> list[dict]:
+    d = p.dir / "handoffs"
+    if not d.is_dir():
+        return []
+    notes = [read_handoff(f) for f in d.glob("*.md")]
+    return sorted(notes, key=lambda h: h.get("updated", ""), reverse=True)
+
+
+def section(body: str, title: str) -> str:
+    m = re.search(rf"^## {re.escape(title)}\s*\n(.*?)(?=^## |\Z)", body, re.S | re.M)
+    return m.group(1).strip() if m else ""
+
+
+# --- brief -------------------------------------------------------------------
+
+def read_capped(path: Path, cap: int, optional: bool = False) -> str:
+    """The file without HTML comments, capped; a pointer instead when it is still the template
+    (nothing at all for an optional file)."""
+    if not path.is_file():
+        return ""
+    strip = lambda s: re.sub(r"<!--.*?-->", "", s, flags=re.S).strip()  # noqa: E731
+    text = strip(path.read_text())
+    template = PLUGIN_ROOT / "templates" / path.name
+    if not text or (template.is_file() and text == strip(template.read_text())):
+        return "" if optional else f"(not filled in yet: edit `{path}`)"
+    return text if len(text) <= cap else text[:cap].rstrip() + f"\n\n… (truncated; read {path} for the rest)"
+
+
+def brief(p: Project, s: Snapshot) -> str:
+    cfg, ref = p.config, s.tracker.ref
+    out = [f"# Project brief: {cfg['name'] or p.repo_name}", ""]
+    out += [f"Main checkout `{p.main}`; ticket worktrees at `{p.worktree('<id>')}`; agent-loop state in `{p.dir}`."]
+    if cfg["contextFiles"]:
+        out += ["Domain and conventions: " + ", ".join(f"`{f}`" for f in cfg["contextFiles"]) + " (in any worktree)."]
+    for e in s.errors:
+        out += [f"> {e}"]
+
+    for title, name, cap, optional in (("Sprint goal", "sprint.md", 4000, False),
+                                       ("Client requirements", "requirements.md", 6000, True)):
+        text = read_capped(p.dir / name, cap, optional)
+        if text:
+            out += ["", f"## {title}", "", text]
+
+    log = p.dir / "decisions.md"
+    if log.is_file():
+        entries = log.read_text().split("\n## ", 1)[1] if "\n## " in log.read_text() else ""
+        if entries:
+            text = "## " + entries.strip()
+            if len(text) > 3000:
+                text = text[:3000].rsplit("\n## ", 1)[0] + f"\n\n… older decisions in `{log}`"
+            out += ["", "## Decisions log (newest first)", "", text.replace("\n## ", "\n### ").replace("## ", "### ", 1)]
+
+    items = knowledge.load(p.dir)
+    if items:
+        out += ["", "## Project knowledge", "",
+                f"Client transcripts, documents and test files, indexed in `{knowledge.kdir(p.dir) / 'INDEX.md'}` "
+                "(file paths and readable text versions there). Confidential: read what a task needs, never copy it "
+                "into code, commits or PR text.", ""]
+        out += [knowledge.index_line(it) for it in sorted(items, key=lambda i: i["date"], reverse=True)]
+
+    if s.board.cards:
+        out += ["", f"## Board ({s.tracker.kind})"]
+        ready = cfg["tracker"]["columns"].get("ready")
+        for name in cfg["tracker"]["show"]:
+            cards = [c for c in s.board.cards if c["status"] == name]
+            if not cards:
+                continue
+            out += ["", f"### {name} ({len(cards)})", ""]
+            for c in cards:
+                t = classify(p, s, c)
+                tag = "" if name != ready else f" [{t['status']}{': ' + t['reason'] if t['reason'] else ''}]"
+                labels = f" ({', '.join(t['labels'])})" if t["labels"] else ""
+                out.append(f"- {ref(c['id'])} {c['name']}{labels}{tag}")
+        known = set(s.by_id()) | s.board.resolved | s.board.open_elsewhere
+        dead = sorted({b for c in s.board.cards for b in c["blockers"] if b not in known})
+        if dead:
+            out += ["", "Dead blocker references: " + ", ".join(ref(b) for b in dead)]
+
+    if s.open_prs or s.merged_prs:
+        out += ["", "## Pull requests", ""]
+        for pr in s.open_prs:
+            state = "draft" if pr.get("isDraft") else (pr.get("reviewDecision") or "awaiting review").lower().replace("_", " ")
+            base = "" if pr["baseRefName"] == p.config["base"].split("/", 1)[-1] else f", onto `{pr['baseRefName']}`"
+            out.append(f"- #{pr['number']} {pr['title']} (`{pr['headRefName']}`{base}, {state})")
+        if s.merged_prs:
+            out += ["", "Recently merged: " + "; ".join(f"#{pr['number']} {pr['title']}" for pr in s.merged_prs[:8])]
+
+    if s.worktrees:
+        out += ["", "## Local worktrees", ""]
+        out += [f"- `{b}` at `{path}`" for b, path in s.worktrees.items()]
+
+    notes = handoffs(p)
+    if notes:
+        out += ["", "## Agent handoffs (newest first)", ""]
+        for h in notes[:12]:
+            out.append(f"### {ref(h['id'])} {h.get('title', '')} [{h.get('status', '?')}]")
+            for part in ("Summary", "Decisions", "Follow-ups"):
+                text = section(h["body"], part)
+                if text:
+                    out += [f"{part}: {text}" if "\n" not in text else f"{part}:\n{text}"]
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+# --- detect --------------------------------------------------------------------
+
+def session_host() -> str:
+    """Which tool is running this session: cursor, claude, codex, or "" when none of the markers is set."""
+    if os.environ.get("CURSOR_AGENT"):
+        return "cursor"
+    if os.environ.get("CLAUDECODE"):
+        return "claude"
+    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_THREAD_ID"):
+        return "codex"
+    return ""
+
+
+def make_targets(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    return re.findall(r"^([A-Za-z][\w-]*):", path.read_text(), re.M)
+
+
+def detect(start: Path, tracker_url: str | None) -> dict:
+    """Facts about the repo and a config suggested from them; the setup wizard confirms the rest."""
+    import stacking
+    common = git_common_dir(start)
+    if not common:
+        raise SystemExit("Not inside a git repository.")
+    bare = git(common, "rev-parse", "--is-bare-repository", check=False).strip() == "true"
+    root = common.parent
+    worktrees: dict[str, str] = {}
+    path = None
+    for line in git(common, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line.startswith("branch refs/heads/") and path:
+            worktrees[line[18:]] = path
+    head = git(common, "symbolic-ref", "-q", "refs/remotes/origin/HEAD", check=False).strip()
+    default = head.rsplit("/", 1)[-1] if head else "main"
+    main = root
+    if bare:
+        # The folder named after the default branch, else the worktree on it, else any not under .claude/
+        paths = [Path(x) for x in worktrees.values()]
+        candidates = [x for x in paths if x.name == default]
+        if default in worktrees:
+            candidates.append(Path(worktrees[default]))
+        candidates += [x for x in paths if ".claude" not in x.parts] + paths
+        main = candidates[0] if candidates else root
+    remote = git(common, "remote", "get-url", "origin", check=False).strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?$", remote)
+    repo = m.group(1) if m else ""
+
+    checks, setup, exclusive, context = [], [], [], []
+    targets = make_targets(main / "Makefile")
+    for t in ("lint", "typecheck", "test-unit"):
+        if t in targets:
+            checks.append(f"make {t}")
+    if "test-unit" not in targets and "test" in targets:
+        checks.append("make test")
+    pkg = main / "package.json"
+    if pkg.is_file() and not checks:
+        scripts = json.loads(pkg.read_text()).get("scripts", {})
+        runner = "pnpm" if (main / "pnpm-lock.yaml").exists() else "yarn" if (main / "yarn.lock").exists() else "npm run"
+        checks += [f"{runner} {s}" for s in ("lint", "typecheck", "test") if s in scripts]
+    if (main / ".env").exists():
+        setup.append("test -f .env || cp {main}/.env .env")
+    for lock, cmd in (("uv.lock", "uv sync -q"), ("poetry.lock", "poetry install -q"), ("pnpm-lock.yaml", "pnpm install --frozen-lockfile"),
+                      ("yarn.lock", "yarn install --frozen-lockfile"), ("package-lock.json", "npm ci"), ("Gemfile.lock", "bundle install")):
+        if (main / lock).exists():
+            setup.append(cmd)
+            exclusive.append(lock)
+    for manifest in ("pyproject.toml", "package.json", "Gemfile"):
+        if (main / manifest).exists():
+            exclusive.append(manifest)
+    for d in ("alembic/versions", "migrations", "prisma/migrations", "db/migrate", "src/migrations"):
+        if (main / d).is_dir():
+            exclusive.append(d + "/")
+    for f in ("AGENTS.md", "CLAUDE.md", "CONTEXT.md", "CONTRIBUTING.md", "docs/adr", "docs/notes"):
+        if (main / f).exists():
+            context.append(f + ("/" if (main / f).is_dir() else ""))
+    sensitive = [d + "/**" for d in (".github/workflows", ".gitlab", "alembic/versions", "migrations", "prisma/migrations", "db/migrate")
+                 if (main / d).is_dir()]
+    sensitive += [f for f in (".gitlab-ci.yml", "Dockerfile", "Procfile", "fly.toml", "render.yaml", "vercel.json") if (main / f).is_file()]
+    tracked = git(main, "ls-files", check=False).splitlines()
+    sensitive += sorted(f for f in tracked if re.search(r"(^|/)(auth|security|permissions?|billing|payments?)[^/]*\.\w+$", f)
+                        and not re.search(r"(^|/)tests?/", f))[:10]
+    template = next((t for t in (".github/PULL_REQUEST_TEMPLATE.md", ".github/pull_request_template.md",
+                                 "docs/pull_request_template.md", "PULL_REQUEST_TEMPLATE.md") if (main / t).is_file()), "")
+
+    config = merged(DEFAULT_CONFIG, {
+        "name": repo.rsplit("/", 1)[-1] if repo else root.name,
+        "repo": repo,
+        "base": f"origin/{default}",
+        "mainWorktree": os.path.relpath(main, root),
+        "worktreePath": "{root}/{id}" if bare else "{root}/../{repo}-worktrees/{id}",
+        "setup": setup, "checks": checks, "exclusive": exclusive, "contextFiles": context, "sensitivePaths": sensitive,
+        "pr": {"template": template},
+    })
+    if tracker_url:
+        config["tracker"] = merged(config["tracker"], parse_tracker_url(tracker_url))
+    agents_md = (main / "AGENTS.md").read_text() if (main / "AGENTS.md").is_file() else ""
+    return {
+        "facts": {
+            "layout": "bare repo with sibling worktrees" if bare else "clone",
+            "root": str(root), "main": str(main), "gitDir": str(common), "remote": remote,
+            "defaultBranch": default, "store": str(root / ".agent-loop") if bare else str(common / "agent-loop"),
+            "makeTargets": targets, "prTemplate": template,
+            "reviewFile": (main / "REVIEW.md").is_file(),
+            "agentsForbidCommits": bool(re.search(r"(?i)git commit.{0,120}(confirm|only after)", agents_md)),
+            "host": session_host(),
+            "ghStack": stacking.gh_stack_installed(),
+            "credentials": {
+                "trello": bool(os.environ.get("TRELLO_KEY") and os.environ.get("TRELLO_TOKEN")),
+                "jira": bool(os.environ.get("JIRA_EMAIL") and os.environ.get("JIRA_API_TOKEN")),
+            },
+            "existingConfig": str(p.dir / "config.json") if (p := find_project(start)) else "",
+        },
+        "config": config,
+    }
+
+
+# --- commands ----------------------------------------------------------------
+
+def scaffold(d: Path) -> None:
+    (d / "handoffs").mkdir(parents=True, exist_ok=True)
+    (d / "plans").mkdir(exist_ok=True)
+    for name in ("sprint.md",):  # requirements.md is optional: most projects keep that in tickets and repo docs
+        target = d / name
+        if not target.exists():
+            target.write_text((PLUGIN_ROOT / "templates" / name).read_text())
+            print(f"created {target}")
+
+
+def cmd_init(a) -> None:
+    start = Path(a.root or Path.cwd()).resolve()
+    if a.config:
+        cfg = json.loads(Path(a.config).read_text())
+    else:
+        cfg = json.loads((PLUGIN_ROOT / "templates" / "config.json").read_text())
+    common = git_common_dir(start)
+    store = a.store or ("git" if common and not a.root and
+                        git(common, "rev-parse", "--is-bare-repository", check=False).strip() == "false" else "root")
+    if store == "git":
+        if not common:
+            raise SystemExit("--store git needs a git repository")
+        d = common / "agent-loop"
+    else:
+        d = (Path(a.root).resolve() if a.root else common.parent if common else start) / ".agent-loop"
+    d.mkdir(parents=True, exist_ok=True)
+    target = d / "config.json"
+    if target.exists() and not a.config:
+        print(f"kept {target}")
+    else:
+        target.write_text(json.dumps(cfg, indent=2) + "\n")
+        print(f"wrote {target}")
+    scaffold(d)
+
+
+def cmd_detect(a) -> None:
+    print(json.dumps(detect(Path.cwd(), a.tracker_url), indent=2))
+
+
+def cmd_statuses(a) -> None:
+    p = require_project(a.config)
+    t = tracker_for(p)
+    if (missing := t.missing_creds()):
+        raise SystemExit(f"Cannot read the board: {missing}")
+    print(json.dumps(t.columns()))
+
+
+def cmd_show_config(a) -> None:
+    p = require_project(a.config)
+    print(json.dumps({**p.config, "root": str(p.root), "dir": str(p.dir), "main": str(p.main)}, indent=2))
+
+
+AGENT_LOGIN = {"claude": "install Claude Code and run `claude` once to log in",
+               "codex": "codex login", "cursor": "cursor-agent login"}
+
+
+def agent_ready(tool: str) -> tuple[bool, str]:
+    """Whether a headless agent tool is installed and logged in."""
+    cmd = {"claude": ["claude", "--version"], "codex": ["codex", "login", "status"], "cursor": ["cursor-agent", "status"]}.get(tool)
+    if not cmd:
+        return False, f"unknown tool (use {', '.join(AGENT_LOGIN)})"
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, "not installed"
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out.stdout + out.stderr).strip()
+    if out.returncode or "not logged in" in text.lower():
+        return False, text.splitlines()[-1] if text else f"exit {out.returncode}"
+    return True, ""
+
+
+def cmd_doctor(a) -> None:
+    p = require_project(a.config)
+    cfg, results = p.config, []
+
+    def check(ok: bool, what: str, fix: str = "") -> None:
+        results.append(ok)
+        print(f"{'ok  ' if ok else 'FAIL'} {what}" + (f"\n     fix: {fix}" if fix and not ok else ""))
+
+    print(f"config {p.dir / 'config.json'}")
+    for tool in sorted({v for v in cfg["agents"].values() if v}):
+        ok, detail = agent_ready(tool)
+        check(ok, f"agent tool {tool}{': ' + detail if detail else ''}", AGENT_LOGIN.get(tool, ""))
+    t = tracker_for(p)
+    missing = t.missing_creds()
+    check(not missing, f"{t.kind} credentials", missing or "")
+    if not missing:
+        try:
+            cols = t.columns()
+            check(True, f"{t.kind} board readable ({len(cols)} columns: {', '.join(cols)})")
+            wanted = list(cfg["tracker"]["columns"].values()) + cfg["tracker"]["show"] + cfg["tracker"]["done"]
+            unknown = sorted({c for c in wanted if c not in cols})
+            check(not unknown, "configured columns exist on the board", "rename in config: " + ", ".join(unknown))
+        except (RuntimeError, OSError, KeyError, subprocess.TimeoutExpired) as e:
+            fix = "gh auth refresh -s project" if "scope" in str(e) else "check the board id and credentials"
+            check(False, f"{t.kind} board readable: {e}", fix)
+    if cfg["repo"]:
+        try:
+            gh_json("repo", "view", cfg["repo"], "--json", "name")
+            check(True, f"GitHub repo {cfg['repo']} readable")
+        except RuntimeError as e:
+            check(False, f"GitHub repo {cfg['repo']}: {e}", "gh auth login")
+    else:
+        check(False, "repo is set", "set \"repo\": \"owner/name\"")
+    check(bool(git(p.root, "rev-parse", "--verify", "-q", cfg["base"], check=False).strip()),
+          f"base {cfg['base']} exists", f"git -C {p.root} fetch origin")
+    check(p.main.is_dir(), f"main checkout {p.main}", "fix mainWorktree")
+    parent = p.worktree("X").parent
+    check(parent.is_dir() or os.access(parent.parent, os.W_OK), f"worktree folder {parent} usable", "fix worktreePath")
+    for cmd in cfg["checks"] + cfg["setup"]:
+        word = shlex.split(cmd)[0]
+        ok = word in ("test", "cp", "[") or bool(shutil.which(word))
+        if ok and word == "make":
+            target = shlex.split(cmd)[1] if len(shlex.split(cmd)) > 1 else ""
+            ok = not target or target in make_targets(p.main / "Makefile")
+        check(ok, f"command `{cmd}`", "install it or change checks/setup")
+    stack = cfg["pr"].get("stack") or "chains"
+    check(stack in ("chains", "sprint"), f"pr.stack is {stack}", "set pr.stack to \"chains\" or \"sprint\"")
+    if stack == "sprint" and cfg["pr"].get("ghStack", True):
+        import stacking
+        check(stacking.gh_stack_installed(), "gh stack installed (links each sprint's PRs into a GitHub stack)",
+              "gh extension install github/gh-stack, or set pr.ghStack to false for chained PRs without a GitHub stack")
+    tpl = cfg["pr"].get("template")
+    check(not tpl or (p.main / tpl).is_file(), f"PR template {tpl or '(none)'}", "fix pr.template or set it to \"\"")
+    if not all(results):
+        raise SystemExit(1)
+
+
+def trim_brief(text: str, limit: int) -> str:
+    """Fit the brief under `limit` characters, dropping the least useful parts first."""
+    if not limit or len(text) <= limit:
+        return text
+    head, _, notes = text.partition("\n## Agent handoffs (newest first)\n")
+    blocks = [b for b in re.split(r"\n(?=### )", notes) if b.strip()]
+    while blocks and len(head) + sum(len(b) for b in blocks) + 60 > limit:
+        blocks.pop()  # oldest handoff first
+    if blocks:
+        head += "\n## Agent handoffs (newest first)\n" + "\n".join(blocks)
+    for pattern in (r"\n## Local worktrees\n.*?(?=\n## |\Z)", r"\nRecently merged: [^\n]*"):
+        if len(head) > limit:
+            head = re.sub(pattern, "", head, flags=re.S)
+    if len(head) > limit:
+        head = head[:limit].rsplit("\n", 1)[0]
+    return head.rstrip() + "\n\n(Brief shortened to fit; `brief.md` in the agent-loop folder has all of it.)\n"
+
+
+def hook_input() -> dict:
+    """The JSON a session hook gets on stdin (Claude Code, Codex and Cursor all send one), if any."""
+    stdin = sys.stdin
+    if stdin is None or stdin.isatty():
+        return {}
+    try:
+        if not select.select([stdin], [], [], 2.0)[0]:
+            return {}  # an open pipe nobody writes to: never hang session start
+    except (ValueError, OSError, io.UnsupportedOperation):
+        pass  # not a real file (tests); just read it
+    try:
+        return json.loads(stdin.read() or "{}")
+    except ValueError:
+        return {}
+
+
+def cmd_brief(a) -> None:
+    event = hook_input() if a.hook else {}
+    start = event.get("cwd") or next(iter(event.get("workspace_roots") or []), None)
+    p = find_project(Path(start) if start else None) if a.hook else require_project(a.config)
+    if not p:
+        return
+    text = brief(p, snapshot(p))
+    try:
+        (p.dir / "brief.md").write_text(text)
+    except OSError:
+        pass
+    if a.hook:
+        intro = ("The agent-loop plugin generated this brief for the project this session runs in. "
+                 "It is current as of session start; the agent-loop brief skill refreshes it.\n\n")
+        context = intro + trim_brief(text, a.max_chars)
+        if "cursor_version" in event:
+            print(json.dumps({"additional_context": context}))
+        else:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+    elif a.json:
+        print(json.dumps({"brief": text, "path": str(p.dir / "brief.md")}))
+    else:
+        print(trim_brief(text, a.max_chars) if a.max_chars else text)
+
+
+def picked_ids(s: Snapshot, raw: list[str]) -> list[str]:
+    return [s.tracker.norm_id(x) for x in raw]
+
+
+def cmd_tickets(a) -> None:
+    p = require_project(a.config)
+    s = snapshot(p)
+    if not s.board.cards:
+        raise SystemExit("\n".join(s.errors) or "The board has no tickets.")
+    if a.ids:
+        by = s.by_id()
+        ids = picked_ids(s, a.ids)
+        missing = [i for i in ids if i not in by]
+        if missing:
+            raise SystemExit("Not on the board: " + ", ".join(s.tracker.ref(i) for i in missing))
+        picked = [classify(p, s, by[i]) for i in ids]
+    else:
+        ready = p.config["tracker"]["columns"]["ready"]
+        picked = [classify(p, s, c) for c in s.board.cards if c["status"] == ready]
+        if not a.all:
+            picked = [t for t in picked if t["status"] == "ready"]
+    print(json.dumps(picked, indent=2))
+
+
+def run_setup(p: Project, wt: Path) -> list[dict]:
+    results = []
+    for cmd in p.config["setup"]:
+        cmd = cmd.format(root=p.root, main=p.main, worktree=wt)
+        r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True)
+        results.append({"cmd": cmd, "ok": r.returncode == 0, "tail": (r.stdout + r.stderr).strip()[-300:]})
+    return results
+
+
+def prepare(p: Project, s: Snapshot, ids: list[str], force: bool = False,
+            waiting: dict[str, list[str]] | None = None) -> tuple[list[dict], list[dict]]:
+    """Create or reuse each ticket's worktree and run setup; returns (prepared tickets, skipped ones).
+
+    `waiting` maps a blocked ticket to the tickets of this same run it waits for: it is prepared
+    like a ready one and carries `waitFor`, so the workflow can start it once those are done."""
+    waiting = waiting or {}
+    by = s.by_id()
+    git(p.root, "fetch", "-q", "origin")
+    tickets, skipped = [], []
+    for cid in ids:
+        if cid not in by:
+            skipped.append({"id": cid, "error": "not on the board"})
+            continue
+        t = classify(p, s, by[cid])
+        wt = Path(t["worktree"])
+        if t["status"] == "blocked" and cid in waiting:
+            t["waitFor"] = waiting[cid]
+        elif t["status"] == "blocked" and not force:
+            skipped.append({**t, "error": t["reason"]})
+            continue
+        if not wt.exists():
+            wt.parent.mkdir(parents=True, exist_ok=True)
+            exists = git(p.root, "rev-parse", "--verify", "-q", f"refs/heads/{t['branch']}", check=False).strip()
+            if exists:
+                git(p.root, "worktree", "add", str(wt), t["branch"])
+            else:
+                git(p.root, "worktree", "add", "--no-track", "-b", t["branch"], str(wt), t["base"])
+            t["created"] = True
+        t["setup"] = run_setup(p, wt)
+        failed = [x for x in t["setup"] if not x["ok"]]
+        if failed:
+            skipped.append({**t, "error": f"setup failed: {failed[0]['cmd']}: {failed[0]['tail']}"})
+        else:
+            tickets.append(t)
+    return tickets, skipped
+
+
+def run_project(p: Project) -> dict:
+    """The project settings a run needs."""
+    cfg = p.config
+    return {"root": str(p.root), "dir": str(p.dir), "briefPath": str(p.dir / "brief.md"),
+            "knowledgeIndex": str(knowledge.kdir(p.dir) / "INDEX.md") if knowledge.load(p.dir) else "",
+            **{k: cfg[k] for k in ("checks", "exclusive", "maxParallel", "maxFixRounds", "review", "sensitivePaths", "commitAtHandoff")}}
+
+
+def cmd_prepare(a) -> None:
+    p = require_project(a.config)
+    s = snapshot(p)
+    tickets, skipped = prepare(p, s, picked_ids(s, a.ids), a.force)
+    print(json.dumps({"project": run_project(p), "tickets": tickets, "skipped": skipped}, indent=2))
+
+
+def runs_dir(p: Project) -> Path:
+    return p.dir / "runs"
+
+
+def cmd_run(a) -> None:
+    """Start a run (prepare the tickets, then the loop), or resume one."""
+    import runner
+    p = require_project(a.config)
+    if a.resume:
+        run_dir = runs_dir(p) / a.resume
+        if not (run_dir / "run.json").is_file():
+            raise SystemExit(f"No run {a.resume} in {runs_dir(p)}")
+        run = runner.Run.load(run_dir)
+        if a.build and run.plan_only:
+            run.plan_only = False
+            run.update(planOnly=False, finished=None)
+    else:
+        s = snapshot(p)
+        if not s.board.cards:
+            raise SystemExit("\n".join(s.errors) or "The board has no tickets.")
+        if a.ids:
+            ids = picked_ids(s, a.ids)
+        else:
+            ready = p.config["tracker"]["columns"]["ready"]
+            ids = [c["id"] for c in s.board.cards if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
+        if not ids:
+            raise SystemExit("No ready tickets.")
+        tickets, skipped = prepare(p, s, ids, a.force)
+        for x in skipped:
+            print(f"skipped {s.tracker.ref(x['id'])}: {x['error']}", file=sys.stderr)
+        if not tickets:
+            raise SystemExit("Nothing to run.")
+        (p.dir / "brief.md").write_text(brief(p, s))
+        run_dir = runs_dir(p) / time.strftime("%Y%m%d-%H%M%S")
+        run_dir.mkdir(parents=True)
+        run = runner.Run(run_dir, run_project(p), tickets, p.config["agents"], p.config["agentModels"],
+                         p.config["agentTimeoutMinutes"], p.config["agentArgs"], a.plan)
+        run.save()
+        run.update(skipped=[{"id": x["id"], "error": x["error"]} for x in skipped])
+    if a.detach:
+        cmd = [sys.executable, str(Path(__file__).resolve()), "--config", str(p.dir / "config.json"), "run", "--resume", run.id]
+        with open(run.dir / "detached.log", "a") as out:
+            proc = subprocess.Popen(cmd, cwd=p.root, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+        run.update(pid=proc.pid)
+        print(json.dumps({"run": run.id, "pid": proc.pid, "log": str(run.dir / "log.txt"),
+                          "tickets": [t["ref"] for t in run.tickets]}))
+        return
+    import adapters
+    summary = runner.Loop(run, adapters.run_agent).execute()
+    print(json.dumps({"run": run.id, **summary}, indent=2))
+
+
+def commit_ticket(wt: Path, message: str, base: str = "") -> tuple[str, str]:
+    """Commit a ready ticket's staged change on its branch, locally: (commit, error).
+
+    A Python step makes this commit, not an agent, so a ticket waiting on this one can build on
+    it. Signing and commit hooks run as configured; push and the pull request wait for the ship
+    skill and the user's approval."""
+    if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode == 0:
+        # Already committed by an earlier handoff of this ticket (a resumed run): keep that commit.
+        if base and git(wt, "rev-list", "--count", f"{base}..HEAD", check=False).strip() not in ("", "0"):
+            return git(wt, "rev-parse", "HEAD").strip(), ""
+        return "", "nothing is staged"
+    out = subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", message], capture_output=True, text=True,
+                         stdin=subprocess.DEVNULL, timeout=300)
+    if out.returncode:
+        return "", (out.stderr or out.stdout).strip()[-500:] or f"exit {out.returncode}"
+    return git(wt, "rev-parse", "HEAD").strip(), ""
+
+
+def reline(p: Project, run, x: dict, below: dict) -> dict | None:
+    """Put finished ticket `x` on top of finished ticket `below`, in `x`'s own worktree, so that a
+    ticket that needs both can build on one branch. None when it is there; else what stops it:
+    {"resolve": {...}} for an agent (call again after it), or {"reason": ...}.
+
+    A conflict, or a check that fails on top of `below`, gets one resolve agent; the handoff then
+    says `resolved:`, and the ship skill reviews that change before it publishes it."""
+    import runner
+    import stacking
+    wt, ref = x["worktree"], tracker_for(p).ref
+    st = ((run.state().get("tickets") or {}).get(x["id"]) or {}).get("reline") or {}
+    handoff = p.dir / "handoffs" / f"{x['id']}.md"
+    note = {**(read_handoff(handoff) if handoff.is_file() else {}), "id": x["id"], "title": x["name"],
+            "worktree": wt, "branch": x["branch"], "path": str(handoff)}
+    save = lambda: run.update(ticket=(x["id"], {"reline": st}))  # noqa: E731
+
+    def agent_for(why: str, problem: str) -> dict:
+        save()
+        return {"resolve": {"id": x["id"], "ref": x["ref"], "why": why, "prompt": stacking.resolve_prompt(
+            p.dir, p.config, str(p.dir / "brief.md"), ref, note, below["branch"], below["id"], problem)}}
+
+    below_commit = stacking.rev(wt, below["branch"])
+    if stacking.rebasing(wt):
+        files = stacking.unmerged(wt) or stacking.has_markers(wt, st.get("files") or [])
+        if files:
+            if st.get("tries", 0) >= 2:
+                return {"reason": f"{x['ref']} conflicts with {below['ref']} in {', '.join(files)}; the rebase is left in progress in {wt}"}
+            st["tries"] = st.get("tries", 0) + 1
+            return agent_for(f"conflicts with {below['ref']}", stacking.conflict_problem(files))
+        stacking.git(wt, "rebase", "--continue", env=stacking.NO_EDITOR)
+        st["resolved"] = True
+        if stacking.rebasing(wt):
+            st.update(files=stacking.unmerged(wt), tries=st.get("tries", 0) + 1)
+            return agent_for(f"conflicts with {below['ref']}", stacking.conflict_problem(st["files"]))
+        st["phase"] = "checks"
+    elif st.get("phase") != "checks" and not stacking.is_ancestor(wt, below_commit, "HEAD"):
+        fork = stacking.out(wt, "merge-base", "HEAD", x["base"])
+        if not fork:
+            return {"reason": f"cannot tell where {x['ref']}'s own commits start"}
+        stacking.git(wt, "rebase", "--onto", below_commit, fork, env=stacking.NO_EDITOR)
+        st.update(phase="checks", tries=0)
+        if stacking.rebasing(wt):
+            st.update(phase="rebase", files=stacking.unmerged(wt), tries=1)
+            return agent_for(f"conflicts with {below['ref']}", stacking.conflict_problem(st["files"]))
+    if st.get("phase") == "rebase":  # the rebase was finished outside reline (by hand, after it gave up)
+        st.update(phase="checks", resolved=True)
+    if st.get("phase") == "checks":
+        if stacking.git(wt, "diff", "--cached", "--quiet").returncode:
+            stacking.git(wt, "commit", "-q", "--amend", "--no-edit")
+            st["resolved"] = True
+        failing = [c for c in runner.run_checks(wt, p.config["checks"]) if not c["ok"]]
+        if failing:
+            if st.get("checkTries", 0) >= 1:
+                return {"reason": f"{x['ref']} fails {', '.join(c['cmd'] for c in failing)} on top of {below['ref']}"}
+            st["checkTries"] = 1
+            return agent_for(f"fails its checks on top of {below['ref']}", stacking.checks_problem(failing))
+        st["phase"] = "done"
+    commit = stacking.out(wt, "rev-parse", "HEAD")
+    x["base"] = below["branch"]
+    run.tickets = [x if t["id"] == x["id"] else t for t in run.tickets]
+    run.update(prepared=run.tickets, ticket=(x["id"], {"commit": commit, "reline": st}))
+    if handoff.is_file():
+        stacking.set_meta(handoff, "base", below["branch"])
+        stacking.set_meta(handoff, "commit", commit)
+        if st.get("resolved"):
+            stacking.set_meta(handoff, "resolved", f"moved onto {below['ref']} during the sprint, and an agent combined the two")
+        else:  # a clean rebase: nothing to review, but its reviewed commit changed
+            stacking.set_meta(handoff, "relined", f"moved onto {below['ref']} during the sprint (clean rebase, checks passed)")
+    return None
+
+
+def stack_ticket(p: Project, run, tid: str, onto: str, needs: list[str]) -> dict:
+    """Move a waiting ticket's worktree onto a finished ticket's commit, so it builds on that work.
+
+    The waiting ticket has only been planned: its worktree must hold no tracked change and no
+    commit past its base. When it needs finished tickets that are on separate branches, they are
+    put in a line first, each on the one before (`reline`), and it goes on the top one. A branch
+    that another ticket of the run builds on is never moved. A conflict or a failing check answers
+    `resolve`: the workflow runs that agent, then calls this again, which carries on."""
+    def fail(reason: str) -> dict:
+        return {"ok": False, "reason": reason, "base": "", "tree": "", "resolve": None}
+
+    by = {t["id"]: t for t in run.tickets}
+    state = run.state().get("tickets") or {}
+    t, blocker = by.get(tid), by.get(onto)
+    if not t or not blocker:
+        return fail(f"#{tid} or #{onto} is not in this run")
+    for need in [onto, *needs]:
+        if (state.get(need) or {}).get("status") != "ready" or not (state.get(need) or {}).get("commit"):
+            return fail(f"{(by.get(need) or {}).get('ref', '#' + need)} is not committed and ready")
+    wt = Path(t["worktree"])
+    if git(wt, "status", "--porcelain", "--untracked-files=no", check=False).strip():
+        return fail(f"{t['ref']} has changes in its worktree")
+    if git(wt, "rev-list", "--count", f"{t['base']}..HEAD", check=False).strip() not in ("", "0"):
+        return fail(f"{t['ref']} has commits of its own")
+
+    import stacking
+    contains = lambda a, b: stacking.is_ancestor(wt, b, a)  # noqa: E731
+    members = list(dict.fromkeys(n for n in [*needs, onto] if n in by))
+    tips = [m for m in members if not any(o != m and contains(by[o]["branch"], by[m]["branch"]) for o in members)]
+    for below, x in zip(tips, tips[1:]):
+        users = [u["ref"] for u in run.tickets if u["id"] not in (tid, x) and u.get("base") == by[x]["branch"]]
+        if users:
+            return fail(f"{by[x]['ref']} cannot move onto {by[below]['ref']}: {', '.join(users)} build on it")
+        stop = reline(p, run, by[x], by[below])
+        if stop:
+            return {**fail(stop.get("reason", "")), "resolve": stop.get("resolve")}
+        by = {u["id"]: u for u in run.tickets}
+    top = by[tips[-1]]
+    for must in [t["base"], *(by[n]["branch"] for n in members)]:
+        if not contains(top["branch"], must):
+            return fail(f"{top['ref']}'s branch does not contain {must}: the work is on separate branches")
+    target = top["branch"]
+    git(wt, "reset", "-q", "--hard", target)
+    t["base"] = target
+    run.tickets = [t if x["id"] == tid else x for x in run.tickets]
+    run.update(prepared=run.tickets, ticket=(tid, {"stage": f"stacked on {top['ref']}"}))
+    return {"ok": True, "reason": "", "base": target, "tree": git(wt, "write-tree", check=False).strip(), "resolve": None}
+
+
+def cmd_stack(a) -> None:
+    """Internal, for the ship skill: the PR stacks of the ready tickets.
+
+    plan    which tickets go into which stack, in what order, on which base (changes nothing);
+            `squash` lists the rebased tickets with more than one commit
+    build   commit each staged ticket locally, rebase it onto the one below (with --squash,
+            squash a ticket with more commits into one first), resolve a conflict with one agent,
+            run the checks and one combine review, and print the push, PR and `gh stack link`
+            commands
+    """
+    import stacking
+    p = require_project(a.config)
+    cfg = p.config
+    t = tracker_for(p)
+    wanted = {t.norm_id(x) for x in a.ids}
+    ready = [h for h in handoffs(p) if h.get("status") == "ready" and (not wanted or h["id"] in wanted)]
+    if not ready:
+        raise SystemExit("No ready tickets to ship.")
+    prs, me, warnings = [], "", []
+    if cfg["repo"]:
+        try:
+            prs = gh_json("pr", "list", "-R", cfg["repo"], "--state", "open", "--limit", "100",
+                          "--json", "number,headRefName,baseRefName,author,url")
+            me = gh("api", "user", "--jq", ".login").strip()
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            warnings.append(f"GitHub unavailable, so no open stack is joined: {e}")
+    mode = cfg["pr"].get("stack") or "chains"
+    link = mode == "sprint" and bool(cfg["pr"].get("ghStack", True))
+    if link and not stacking.gh_stack_installed():
+        warnings.append("`gh stack` is not installed: the PRs are chained, but GitHub gets no stack "
+                        "(gh extension install github/gh-stack)")
+        link = False
+    stacks = stacking.plan(ready, stacking.trunk_of(cfg["base"]), mode, prs, me, link)
+    squash = []
+    for s in stacks:
+        for x in s["tickets"]:
+            onto = stacking.onto_for(x, stacking.trunk_of(cfg["base"]), s["anchor"]) if Path(x["worktree"]).is_dir() else ""
+            own = stacking.own_commits(x["worktree"], x, onto) if x["rebase"] and onto else []
+            if own and len(own) > 1:
+                squash.append({"ref": t.ref(x["id"]), "id": x["id"], "worktree": x["worktree"], "commits": len(own)})
+    if a.action == "build":
+        git(p.root, "fetch", "-q", "origin")
+        import adapters
+        builder = stacking.Builder(run_project(p), cfg, p.dir, stacking.run_dir_for(p.dir), adapters.run_agent, ref=t.ref,
+                                   squash=a.squash)
+        stacks = builder.build(stacks)
+        stacking.commands(stacks, cfg["repo"], str(p.root), p.dir, prs, bool(cfg["pr"].get("draft")))
+    keep = ("id", "title", "branch", "base", "parent", "worktree", "risk", "sensitive", "path", "rebase", "status", "reason",
+            "rebased", "resolved", "relined", "outOfPlan", "checks", "findings", "conflicts", "commit", "stat")
+    print(json.dumps({"mode": mode, "link": link, "warnings": warnings, "squash": squash, "stacks": [
+        {**{k: v for k, v in s.items() if k != "tickets"},
+         "tickets": [{"ref": t.ref(x["id"]), **{k: x[k] for k in keep if k in x}} for x in s["tickets"]]} for s in stacks]}, indent=2))
+
+
+def cmd_wf(a) -> None:
+    """The steps of a Claude Code Workflow run that need files or git; the workflow script has neither.
+
+    start     prepare the tickets and the run folder; print the workflow's arguments
+    checks    run the checks in a worktree; report the risky paths and the staged tree
+    handoff   write a ticket's handoff note from <run dir>/<id>.handoff.json
+    attach    record the Workflow's id and transcript folder, so the panel can show live progress
+    finish    record the workflow's summary (<run dir>/summary.json) in run.json
+    """
+    import runner
+    if a.action == "checks":
+        wt = Path(a.target).resolve()
+        p = find_project(wt)
+        if not p:
+            raise SystemExit(f"No agent-loop project for {wt}")
+        changed = git(wt, "diff", "--cached", "--name-only", a.base or p.config["base"], check=False).splitlines()
+        planned = [f for f in (a.files or "").split(",") if f]
+        outside = runner.out_of_plan(changed, planned, p.config["review"].get("scopeIgnore", runner.DEFAULT_SCOPE_IGNORE))
+        if a.since:  # a re-review judges only the out-of-plan files this fix touched
+            since = set(git(wt, "diff", "--cached", "--name-only", a.since, check=False).splitlines())
+            scope = [f for f in outside if f in since]
+        else:
+            scope = outside
+        result = {"checks": runner.run_checks(str(wt), p.config["checks"]),
+                  "sensitive": runner.sensitive_matches(planned + changed, p.config["sensitivePaths"]),
+                  "tree": git(wt, "write-tree", check=False).strip(), "outOfPlan": outside, "scopeFiles": scope}
+        if a.run and a.id:
+            run_dir = runs_dir(p) / a.run
+            (run_dir / f"{a.id}.checks{a.round or ''}.json").write_text(json.dumps(result, indent=2))
+            runner.Run.load(run_dir).update(ticket=(a.id, {"stage": f"review{a.round or ''}",
+                                                            "risk": "high" if result["sensitive"] else "normal",
+                                                            "sensitive": result["sensitive"]}))
+        print(json.dumps(result))
+        return
+
+    p = require_project(a.config)
+    if a.action == "start":
+        s = snapshot(p)
+        if not s.board.cards:
+            raise SystemExit("\n".join(s.errors) or "The board has no tickets.")
+        ready = p.config["tracker"]["columns"]["ready"]
+        wanted = ([a.target] if a.target else []) + a.ids
+        ids = picked_ids(s, wanted) if wanted else [c["id"] for c in s.board.cards
+                                                    if c["status"] == ready and classify(p, s, c)["status"] == "ready"]
+        waiting: dict[str, list[str]] = {}
+        if p.config["commitAtHandoff"]:
+            by, pool = s.by_id(), set(ids)
+            if not wanted:  # also blocked Ready-column tickets whose blockers all run now
+                pool |= {c["id"] for c in s.board.cards if c["status"] == ready}
+            for cid in sorted(pool):
+                if cid in by and (c := classify(p, s, by[cid]))["status"] == "blocked" and set(c["blockers"]) <= pool:
+                    waiting[cid] = c["blockers"]
+            ids = list(dict.fromkeys(ids + [cid for cid in waiting if cid not in ids]))
+        if not ids:
+            raise SystemExit("No ready tickets.")
+        tickets, skipped = prepare(p, s, ids, a.force, waiting)
+        for x in skipped:
+            print(f"skipped {s.tracker.ref(x['id'])}: {x['error']}", file=sys.stderr)
+        if not tickets:
+            raise SystemExit("Nothing to run.")
+        (p.dir / "brief.md").write_text(brief(p, s))
+        run_dir = runs_dir(p) / time.strftime("%Y%m%d-%H%M%S")
+        run_dir.mkdir(parents=True)
+        project = run_project(p)
+        run = runner.Run(run_dir, project, tickets, {"default": "workflow"}, plan_only=a.plan)
+        run.save()
+        run.update(skipped=[{"id": x["id"], "error": x["error"]} for x in skipped], started=runner.now(), engine="workflow")
+        review_file = (p.config.get("review") or {}).get("file") or ""
+        for t in tickets:
+            t["reviewFile"] = bool(review_file) and (Path(t["worktree"]) / review_file).is_file()
+        prompts = {f.relative_to(runner.PROMPTS).with_suffix("").as_posix(): f.read_text()
+                   for f in sorted(runner.PROMPTS.rglob("*.md"))}
+        print(json.dumps({
+            "run": run.id, "runDir": str(run_dir), "al": f"python3 {Path(__file__).resolve()}", "stamp": runner.now(),
+            "planOnly": a.plan, "project": project, "tickets": tickets, "prompts": prompts, "schemas": runner.SCHEMAS,
+            "knowledge": [{k: it.get(k) for k in ("id", "title", "kind", "date", "summary")} |
+                          {"files": [{"path": f["path"], "text": f.get("text")} for f in it["files"]]}
+                          for it in knowledge.load(p.dir)],
+        }, indent=2))
+        return
+
+    run_dir = runs_dir(p) / a.target
+    run = runner.Run.load(run_dir)
+    if a.action == "stack":
+        print(json.dumps(stack_ticket(p, run, a.id, a.onto, [x for x in (a.needs or "").split(",") if x])))
+        return
+    if a.action == "attach":
+        if not a.transcripts or not Path(a.transcripts).is_dir():
+            raise SystemExit(f"No transcript folder at {a.transcripts}")
+        run.update(workflow={"id": a.wf or "", "transcripts": str(Path(a.transcripts).resolve())})
+        print(f"run {run.id} attached to workflow {a.wf or '?'}")
+    elif a.action == "handoff":
+        data = json.loads((run_dir / f"{a.id}.handoff.json").read_text())
+        t = next(x for x in run.tickets if x["id"] == a.id)
+        res = {"status": data.get("status", "needs-human"), "why": data.get("why", ""), "preExisting": data.get("preExisting") or []}
+        if res["status"] == "ready" and p.config["commitAtHandoff"]:
+            commit, error = commit_ticket(Path(t["worktree"]), (data.get("commitMessage") or "").strip() or t["name"], t["base"])
+            if error:
+                res.update(status="needs-human", why=f"the handoff commit failed: {error}")
+            data["commit"] = commit
+        path = runner.write_handoff_file(p.dir, run.id, t, res, data, data.get("sensitive") or [], data.get("outOfPlan") or [])
+        (run_dir / f"{a.id}.review.json").write_text(json.dumps(
+            {"findings": data.get("findings") or [], "preExisting": res["preExisting"]}, indent=2))
+        run.update(ticket=(a.id, {"stage": "done", "status": res["status"], "why": res["why"], "rounds": data.get("rounds", 0),
+                                  "risk": "high" if data.get("sensitive") else "normal", "commit": data.get("commit") or ""}))
+        print(json.dumps({"path": str(path), "status": res["status"], "commit": data.get("commit") or ""}))
+    elif a.action == "finish":
+        summary = json.loads((run_dir / "summary.json").read_text())
+        # A handoff commit can fail after the workflow counted the ticket ready: run.json has the truth.
+        state = run.state().get("tickets") or {}
+        for r in list(summary.get("ready", [])):
+            now_ = state.get(r["id"]) or {}
+            if now_.get("status") and now_["status"] != "ready":
+                summary["ready"].remove(r)
+                summary.setdefault("needsHuman", []).append({"id": r["id"], "ref": r.get("ref"), "name": r.get("name"),
+                                                            "question": now_.get("why", "")})
+        for d in summary.get("deferred", []):
+            run.update(ticket=(d["id"], {"stage": "done", "status": "deferred", "why": d.get("reason", "")}))
+        for n in summary.get("needsHuman", []):
+            if (run.state().get("tickets") or {}).get(n["id"], {}).get("stage") != "done":
+                run.update(ticket=(n["id"], {"stage": "done", "status": "needs-human", "why": n.get("question", "")}))
+        if summary.get("stoppedAfter") == "plan":
+            for plan in summary.get("plans", []):
+                run.update(ticket=(plan["id"], {"stage": "planned", "status": "planned"}))
+        run.update(summary=summary, finished=runner.now())
+        print(f"run {run.id} recorded")
+
+
+def cmd_status(a) -> None:
+    import runner
+    p = require_project(a.config)
+    d = runs_dir(p)
+    runs = [x.name for x in sorted((x for x in d.iterdir() if (x / "run.json").is_file()) if d.is_dir() else [],
+                                   key=lambda x: (x / "run.json").stat().st_mtime)]  # newest last, whatever the names
+    if not runs:
+        raise SystemExit("No runs yet.")
+    run_id = a.run or runs[-1]
+    path = d / run_id / "run.json"
+    if not path.is_file():
+        raise SystemExit(f"No run {run_id}; runs: {', '.join(runs[-5:])}")
+    state = json.loads(path.read_text())
+    if a.json:
+        state.pop("prepared", None)
+        print(json.dumps(state, indent=2))
+    else:
+        print(runner.status_text(state))
+
+
+def cmd_handoffs(a) -> None:
+    p = require_project(a.config)
+    notes = [h for h in handoffs(p) if not a.status or h.get("status") == a.status]
+    print(json.dumps(notes, indent=2))
+
+
+def cmd_mark(a) -> None:
+    p = require_project(a.config)
+    path = p.dir / "handoffs" / f"{tracker_for(p).norm_id(a.id)}.md"
+    if not path.is_file():
+        raise SystemExit(f"No handoff for {a.id}")
+    text = path.read_text()
+    text = re.sub(r"^status:.*$", f"status: {a.status}", text, count=1, flags=re.M)
+    if a.pr:
+        text = re.sub(r"^pr:.*$\n?", "", text, flags=re.M)
+        text = text.replace("\n---", f"\npr: {a.pr}\n---", 1)
+    path.write_text(text)
+    print(f"{a.id} -> {a.status}")
+    if a.status == "shipped":
+        note = read_handoff(path)
+        decisions = [line[2:].strip() for line in section(note["body"], "Decisions").splitlines() if line.startswith("- ")]
+        ref = tracker_for(p).ref(note["id"])
+        if knowledge.log_decisions(p.dir, ref, note.get("title", ""), decisions, a.pr or note.get("pr")):
+            print(f"logged {len(decisions)} decision(s) in {p.dir / 'decisions.md'}")
+
+
+SUGGEST = {
+    "standards": "a REVIEW.md or AGENTS.md rule, or a lint rule if it is mechanical",
+    "correctness": "an AGENTS.md note on the pattern, or a shared helper or test that makes it impossible",
+    "spec": "the ticket template: acceptance criteria that state this explicitly",
+    "security": "REVIEW.md, and sensitivePaths for the files involved",
+}
+
+
+def cmd_findings(a) -> None:
+    """What the reviewers keep finding across recent runs, so it can be fixed at the source."""
+    p = require_project(a.config)
+    d = runs_dir(p)
+    runs = sorted((x for x in d.iterdir() if x.is_dir()), key=lambda x: x.stat().st_mtime) if d.is_dir() else []
+    groups: dict[str, dict] = {}
+    for run in runs[-a.runs:]:
+        for f in [*run.glob("*.round*.json"), *run.glob("*.review.json")]:
+            ticket = f.name.split(".")[0]
+            result = json.loads(f.read_text())
+            for kind, items in (("confirmed", result.get("findings", [])), ("pre-existing", result.get("preExisting", []))):
+                for it in items:
+                    if kind == "confirmed" and it.get("severity") == "minor":
+                        continue
+                    key = (it.get("class") or it["issue"][:60]).strip().lower()
+                    g = groups.setdefault(key, {"class": key, "tickets": set(), "files": set(), "lenses": set(), "kinds": set(),
+                                                "example": it["issue"]})
+                    g["tickets"].add(f"{run.name}/{ticket}")
+                    g["lenses"].update(x.strip() for x in str(it.get("lens", "")).split(",") if x.strip())
+                    g["kinds"].add(kind)
+                    if it.get("file"):
+                        g["files"].add(it["file"])
+    recurring = sorted((g for g in groups.values() if len(g["tickets"]) >= 2), key=lambda g: -len(g["tickets"]))
+    if a.json:
+        print(json.dumps([{**g, "tickets": sorted(g["tickets"]), "files": sorted(g["files"]), "lenses": sorted(g["lenses"]),
+                           "kinds": sorted(g["kinds"])} for g in recurring], indent=2))
+        return
+    if not recurring:
+        print(f"No finding recurred across the last {min(a.runs, len(runs))} run(s).")
+        return
+    print(f"Findings that recur across the last {min(a.runs, len(runs))} run(s), most frequent first:\n")
+    for g in recurring:
+        lens = sorted(g["lenses"])[0] if g["lenses"] else "correctness"
+        print(f"- {g['class']}: {len(g['tickets'])} tickets ({', '.join(sorted(g['kinds']))}; {', '.join(sorted(g['lenses']))})")
+        print(f"  e.g. {g['example'][:160]}")
+        if g["files"]:
+            print(f"  files: {', '.join(sorted(g['files'])[:5])}")
+        print(f"  fix at the source: {SUGGEST.get(lens, SUGGEST['correctness'])}")
+
+
+def cmd_ingest(a) -> None:
+    p = require_project(a.config)
+    for raw in a.paths:
+        try:
+            it = knowledge.ingest(p.dir, Path(raw), a.kind, a.title if len(a.paths) == 1 else None, a.date,
+                                  a.id if len(a.paths) == 1 else None)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"skipped {raw}: {e}", file=sys.stderr)
+            continue
+        dup = f", {len(it['duplicates'])} duplicate(s) skipped" if it["duplicates"] else ""
+        texts = sum(1 for f in it["files"] if f.get("text"))
+        print(json.dumps({"id": it["id"], "kind": it["kind"], "date": it["date"], "files": len(it["files"]),
+                          "textVersions": texts, "note": f"{len(it['files'])} file(s) copied{dup}",
+                          "dir": str(knowledge.kdir(p.dir) / "items" / it["id"])}))
+
+
+def cmd_knowledge(a) -> None:
+    p = require_project(a.config)
+    items = knowledge.load(p.dir)
+    if a.json:
+        print(json.dumps(items, indent=2))
+    elif not items:
+        print("No knowledge yet; add some with `agentloop.py ingest <file or folder>`.")
+    else:
+        print((knowledge.kdir(p.dir) / "INDEX.md").read_text())
+
+
+def cmd_annotate(a) -> None:
+    p = require_project(a.config)
+    try:
+        it = knowledge.annotate(p.dir, a.id, title=a.title, kind=a.kind, date=a.date, summary=a.summary,
+                                useFor=a.use, status=a.status)
+    except KeyError as e:
+        raise SystemExit(str(e))
+    print(knowledge.index_line(it))
+
+
+def cmd_move(a) -> None:
+    p = require_project(a.config)
+    t = tracker_for(p)
+    if (missing := t.missing_creds()):
+        raise SystemExit(f"Cannot move: {missing}")
+    target = p.config["tracker"]["columns"].get(a.column, a.column)
+    ticket_id = t.norm_id(a.id)
+    print(f"{t.ref(ticket_id)} {t.move(ticket_id, target)} -> {target}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="agentloop")
+    ap.add_argument("--config", help="use this config file instead of looking one up")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    x = sub.add_parser("detect"); x.add_argument("--tracker-url"); x.set_defaults(fn=cmd_detect)
+    x = sub.add_parser("init"); x.add_argument("--root"); x.add_argument("--store", choices=["root", "git"]); x.set_defaults(fn=cmd_init)
+    x = sub.add_parser("doctor"); x.set_defaults(fn=cmd_doctor)
+    x = sub.add_parser("statuses"); x.set_defaults(fn=cmd_statuses)
+    x = sub.add_parser("show-config"); x.set_defaults(fn=cmd_show_config)
+    x = sub.add_parser("brief"); x.add_argument("--hook", action="store_true"); x.add_argument("--json", action="store_true")
+    x.add_argument("--max-chars", type=int, default=None, help="cap the brief (default with --hook: 9000, about 2,300 tokens)")
+    x.set_defaults(fn=cmd_brief)
+    x = sub.add_parser("tickets"); x.add_argument("ids", nargs="*"); x.add_argument("--all", action="store_true"); x.set_defaults(fn=cmd_tickets)
+    x = sub.add_parser("prepare"); x.add_argument("ids", nargs="+"); x.add_argument("--force", action="store_true"); x.set_defaults(fn=cmd_prepare)
+    x = sub.add_parser("run"); x.add_argument("ids", nargs="*"); x.add_argument("--plan", action="store_true")
+    x.add_argument("--force", action="store_true"); x.add_argument("--resume"); x.add_argument("--detach", action="store_true")
+    x.add_argument("--build", action="store_true", help="with --resume: carry a --plan run on into implementation"); x.set_defaults(fn=cmd_run)
+    x = sub.add_parser("wf", help="steps of a Claude Code Workflow run")
+    x.add_argument("action", choices=["start", "checks", "stack", "attach", "handoff", "finish"])
+    x.add_argument("target", nargs="?", help="checks: the worktree; handoff/finish: the run id")
+    x.add_argument("ids", nargs="*"); x.add_argument("--plan", action="store_true"); x.add_argument("--force", action="store_true")
+    x.add_argument("--id"); x.add_argument("--run"); x.add_argument("--round", type=int); x.add_argument("--base"); x.add_argument("--files")
+    x.add_argument("--since", help="checks: the tree of the last review that ran; out-of-plan files are judged only when this fix touched them")
+    x.add_argument("--onto", help="stack: the finished ticket to build on"); x.add_argument("--needs", help="stack: other finished tickets the new base must contain")
+    x.add_argument("--wf", help="attach: the Workflow run id"); x.add_argument("--transcripts", help="attach: the Workflow transcript folder")
+    x.set_defaults(fn=cmd_wf)
+    x = sub.add_parser("stack", help="internal, for the ship skill: build the PR stacks of the ready tickets")
+    x.add_argument("action", choices=["plan", "build"]); x.add_argument("ids", nargs="*")
+    x.add_argument("--squash", action="store_true", help="the user confirmed: squash a ticket with more than one commit into one")
+    x.set_defaults(fn=cmd_stack)
+    x = sub.add_parser("status"); x.add_argument("run", nargs="?"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_status)
+    x = sub.add_parser("handoffs"); x.add_argument("--status"); x.set_defaults(fn=cmd_handoffs)
+    x = sub.add_parser("mark"); x.add_argument("id"); x.add_argument("status", choices=["ready", "needs-human", "shipped"]); x.add_argument("--pr"); x.set_defaults(fn=cmd_mark)
+    x = sub.add_parser("findings"); x.add_argument("--runs", type=int, default=10); x.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_findings)
+    x = sub.add_parser("ingest"); x.add_argument("paths", nargs="+"); x.add_argument("--kind", choices=knowledge.KINDS)
+    x.add_argument("--title"); x.add_argument("--date"); x.add_argument("--id"); x.set_defaults(fn=cmd_ingest)
+    x = sub.add_parser("knowledge"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_knowledge)
+    x = sub.add_parser("annotate"); x.add_argument("id"); x.add_argument("--title"); x.add_argument("--kind", choices=knowledge.KINDS)
+    x.add_argument("--date"); x.add_argument("--summary"); x.add_argument("--use"); x.add_argument("--status", choices=["new", "distilled"])
+    x.set_defaults(fn=cmd_annotate)
+    x = sub.add_parser("move"); x.add_argument("id"); x.add_argument("column"); x.set_defaults(fn=cmd_move)
+    a = ap.parse_args(argv)
+    if getattr(a, "hook", False) and a.max_chars is None:
+        a.max_chars = 9000
+    try:
+        a.fn(a)
+    except RuntimeError as e:
+        if getattr(a, "hook", False):
+            return  # never break session start
+        raise SystemExit(str(e))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

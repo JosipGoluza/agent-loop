@@ -1,0 +1,67 @@
+{
+  "name": "",
+  "repo": "",
+  "base": "origin/main",
+  "mainWorktree": ".",
+  "worktreePath": "{root}/../{repo}-worktrees/{id}",
+  "branch": "{type}/{slug}",
+  "typeByLabel": {
+    "bug": "fix",
+    "chore": "chore"
+  },
+  "defaultType": "feat",
+  "setup": [],
+  "checks": [],
+  "exclusive": [],
+  "contextFiles": [],
+  "maxParallel": 10,
+  "maxFixRounds": 2,
+  "agents": {
+    "default": "claude",
+    "plan": null,
+    "implement": null,
+    "review": null,
+    "fix": null,
+    "handoff": null
+  },
+  "agentModels": {},
+  "agentArgs": {},
+  "agentTimeoutMinutes": 30,
+  "review": {
+    "lenses": [
+      "spec",
+      "correctness",
+      "standards"
+    ],
+    "verify": true,
+    "votes": 3,
+    "file": "REVIEW.md",
+    "scopeIgnore": ["*.lock", "package-lock.json", "pnpm-lock.yaml", "poetry.lock", "uv.lock"]
+  },
+  "sensitivePaths": [],
+  "commitAtHandoff": true,
+  "tracker": {
+    "type": "trello",
+    "columns": {
+      "ready": "Sprint Backlog",
+      "doing": "In Progress",
+      "review": "Code Review"
+    },
+    "show": [
+      "Sprint Backlog",
+      "In Progress",
+      "Code Review"
+    ],
+    "done": [
+      "Done"
+    ],
+    "blockerSection": "Blockers"
+  },
+  "pr": {
+    "template": ".github/PULL_REQUEST_TEMPLATE.md",
+    "ticketLine": "#### Ticket [{ref}]({url})",
+    "draft": false,
+    "stack": "chains",
+    "ghStack": true
+  }
+}

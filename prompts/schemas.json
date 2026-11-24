@@ -1,0 +1,279 @@
+{
+  "plan": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "feasible": {
+        "type": "boolean"
+      },
+      "question": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "summary": {
+        "type": "string"
+      },
+      "files": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "steps": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "risks": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "planMarkdown": {
+        "type": "string"
+      },
+      "knowledge": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "feasible",
+      "question",
+      "summary",
+      "files",
+      "steps",
+      "risks",
+      "planMarkdown",
+      "knowledge"
+    ]
+  },
+  "build": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "summary": {
+        "type": "string"
+      },
+      "checks": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cmd": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "cmd",
+            "ok"
+          ]
+        }
+      },
+      "stuck": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "responses": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "n": {
+              "type": "integer"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "fixed",
+                "disputed"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "n",
+            "action",
+            "note"
+          ]
+        }
+      }
+    },
+    "required": [
+      "summary",
+      "checks",
+      "stuck",
+      "responses"
+    ]
+  },
+  "handoff": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "summary": {
+        "type": "string"
+      },
+      "decisions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "followUps": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "openFindings": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "commitMessage": {
+        "type": "string"
+      },
+      "prTitle": {
+        "type": "string"
+      },
+      "prChanges": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "testing": {
+        "type": "string"
+      },
+      "risk": {
+        "type": "string"
+      },
+      "revert": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "summary",
+      "decisions",
+      "followUps",
+      "openFindings",
+      "commitMessage",
+      "prTitle",
+      "prChanges",
+      "testing",
+      "risk",
+      "revert"
+    ]
+  },
+  "findings": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "severity": {
+              "type": "string",
+              "enum": [
+                "blocker",
+                "major",
+                "minor"
+              ]
+            },
+            "file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "issue": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "string"
+            },
+            "fix": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "introduced": {
+              "type": "boolean"
+            },
+            "class": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "severity",
+            "file",
+            "line",
+            "issue",
+            "evidence",
+            "fix",
+            "introduced",
+            "class"
+          ]
+        }
+      }
+    },
+    "required": [
+      "findings"
+    ]
+  },
+  "verify": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "confirmed",
+          "refuted"
+        ]
+      },
+      "severity": {
+        "type": "string",
+        "enum": [
+          "blocker",
+          "major",
+          "minor"
+        ]
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "verdict",
+      "severity",
+      "reason"
+    ]
+  }
+}

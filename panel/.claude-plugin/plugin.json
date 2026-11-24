@@ -1,0 +1,11 @@
+{
+  "name": "agent-loop-panel",
+  "version": "0.3.0",
+  "description": "Live progress of the current agent-loop run above the prompt, from the agents' own transcripts; a full pane on /agent-loop-panel.",
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "author": {
+    "name": "Juraj Sulimanović"
+  },
+  "repository": "https://github.com/Juraj-Sulimanovic/agent-loop"
+}

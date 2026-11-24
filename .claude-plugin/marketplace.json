@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-loop",
+  "description": "Local marketplace for the agent-loop plugin",
+  "owner": {
+    "name": "Juraj Sulimanović"
+  },
+  "plugins": [
+    {
+      "name": "agent-loop",
+      "description": "Project brief at session start, and a plan/implement/review/fix/ship loop over tickets in parallel worktrees, run by Claude Code, Codex or Cursor.",
+      "source": "./"
+    },
+    {
+      "name": "agent-loop-panel",
+      "description": "Claude Code only: a live pane beside the chat with the progress of the current agent-loop run.",
+      "source": "./panel"
+    }
+  ]
+}
